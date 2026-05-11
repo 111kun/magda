@@ -1,35 +1,186 @@
-import React, { FunctionComponent, useEffect, useRef, useState } from "react";
+import React, { FunctionComponent, useLayoutEffect, useMemo } from "react";
 import { Message } from "rsuite";
-import { config } from "config";
-import { useAsync } from "react-async-hook";
 import stripJsonComments from "strip-json-comments";
+import L from "leaflet";
+import { Map, TileLayer, GeoJSON } from "react-leaflet";
+import "leaflet/dist/leaflet.css";
+import "./GeoJsonViewer.scss";
 
-function generate_init_data(geoJson: any): any {
-    const catlogData = {
-        initSources: [
-            {
-                homeCamera: {
-                    north: -8,
-                    east: 158,
-                    south: -45,
-                    west: 109
-                },
-                baseMapName: "Positron (Light)",
-                catalog: [
-                    {
-                        type: "geojson",
-                        id: "my-data-id",
-                        name: "my query data points",
-                        isEnabled: true,
-                        zoomOnEnable: true,
-                        data: geoJson
-                    }
-                ]
-            }
-        ]
-    };
-    return catlogData;
+/** Webpack bundles Leaflet without `leaflet.js` script path; 0.7 needs this set. */
+const LEAFLET_DEFAULT_ICON_IMAGE_PATH =
+    "https://unpkg.com/leaflet@0.7.7/dist/images";
+
+/** Stroke / ring colour for query-result style (hollow red circles, red outlines). */
+const RESULT_LINE_COLOR = "#c62828";
+
+function escapeHtml(text: string): string {
+    return text
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
 }
+
+function sanitizePropertiesForJson(props: unknown): Record<string, unknown> {
+    if (!props || typeof props !== "object" || Array.isArray(props)) {
+        return {};
+    }
+    const out: Record<string, unknown> = {};
+    const raw = props as Record<string, unknown>;
+    for (const key of Object.keys(raw)) {
+        if (key.startsWith("__")) {
+            continue;
+        }
+        const v = raw[key];
+        if (v === undefined) {
+            continue;
+        }
+        if (v !== null && typeof v === "object") {
+            if (
+                typeof ArrayBuffer !== "undefined" &&
+                v instanceof ArrayBuffer
+            ) {
+                out[key] = `(binary, ${v.byteLength} bytes)`;
+                continue;
+            }
+            if (ArrayBuffer.isView(v)) {
+                const view = v as ArrayBufferView;
+                out[key] = `(binary view, ${view.byteLength} bytes)`;
+                continue;
+            }
+        }
+        out[key] = v as unknown;
+    }
+    return out;
+}
+
+function formatFeaturePropertiesPopupHtml(feature: any): string {
+    const props = sanitizePropertiesForJson(feature?.properties);
+    let json = "{}";
+    try {
+        json = JSON.stringify(
+            props,
+            (_k, v) => (typeof v === "bigint" ? v.toString() : v),
+            2
+        );
+    } catch {
+        json = JSON.stringify({ error: "Could not serialize properties" });
+    }
+    const safeJson = escapeHtml(json);
+    return (
+        `<div class="magda-geojson-popup">` +
+        `<div class="magda-geojson-popup-title">Feature properties</div>` +
+        `<pre class="magda-geojson-popup-json">${safeJson}</pre>` +
+        `</div>`
+    );
+}
+
+function geoJsonLayerOptions(): {
+    pointToLayer: (feature: any, latlng: L.LatLng) => L.CircleMarker;
+    style: (feature: any) => L.PathOptions;
+    onEachFeature: (feature: any, layer: L.Layer) => void;
+} {
+    return {
+        pointToLayer: (_feature, latlng) =>
+            L.circleMarker(latlng, {
+                radius: 6,
+                color: RESULT_LINE_COLOR,
+                weight: 2,
+                fillColor: "#ffffff",
+                fillOpacity: 0.15,
+                opacity: 1
+            }),
+        style: () => ({
+            color: RESULT_LINE_COLOR,
+            weight: 2,
+            opacity: 1,
+            fillColor: "#ffcdd2",
+            fillOpacity: 0.22
+        }),
+        onEachFeature(feature, layer) {
+            const html = formatFeaturePropertiesPopupHtml(feature);
+            const withPopup = layer as L.Layer & {
+                bindPopup: (c: string, o?: object) => void;
+            };
+            withPopup.bindPopup(html, {
+                maxWidth: 440,
+                closeButton: true,
+                autoPan: true
+            });
+        }
+    };
+}
+
+function useParsedGeoJson(
+    geoJson: any,
+    isJsonString: boolean | undefined
+): { data: any; error: string | null } {
+    return useMemo(() => {
+        if (isJsonString === false) {
+            return { data: geoJson, error: null };
+        }
+        const geoJsonContent = String(geoJson ?? "").trim();
+        if (!geoJsonContent) {
+            return { data: null, error: "Empty GeoJSON input." };
+        }
+        try {
+            return { data: JSON.parse(geoJsonContent), error: null };
+        } catch {
+            try {
+                return {
+                    data: JSON.parse(stripJsonComments(geoJsonContent)),
+                    error: null
+                };
+            } catch (e) {
+                return { data: null, error: String(e) };
+            }
+        }
+    }, [geoJson, isJsonString]);
+}
+
+const LeafletGeoJsonViewer: FunctionComponent<{ data: any }> = ({ data }) => {
+    useLayoutEffect(() => {
+        L.Icon.Default.imagePath = LEAFLET_DEFAULT_ICON_IMAGE_PATH;
+    }, []);
+
+    const geoJsonOpts = useMemo(() => geoJsonLayerOptions(), []);
+
+    const bounds = useMemo(() => {
+        try {
+            const gj = L.geoJSON(data, geoJsonOpts);
+            const b = gj.getBounds();
+            return b.isValid() ? b : null;
+        } catch {
+            return null;
+        }
+    }, [data, geoJsonOpts]);
+
+    const mapProps = bounds
+        ? ({
+              bounds,
+              boundsOptions: { padding: [24, 24] }
+          } as const)
+        : ({
+              center: [-25.27, 133.78] as L.LatLngTuple,
+              zoom: 4
+          } as const);
+
+    return (
+        <div className="geo-json-viewer-leaflet">
+            <Map
+                {...mapProps}
+                style={{ width: "100%", height: "500px" }}
+                className="geo-json-viewer-leaflet-map"
+            >
+                <TileLayer
+                    url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+                    attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+                />
+                <GeoJSON data={data} {...geoJsonOpts} />
+            </Map>
+        </div>
+    );
+};
 
 interface GeoJsonViewerProps {
     geoJson: any;
@@ -38,90 +189,29 @@ interface GeoJsonViewerProps {
     isJsonString?: boolean;
 }
 
+/** Renders GeoJSON on an embedded Leaflet map (OSM tiles). */
 const GeoJsonViewer: FunctionComponent<GeoJsonViewerProps> = ({
     geoJson,
     isJsonString
 }) => {
-    const iframeRef = useRef<HTMLIFrameElement>(null);
-    const [isReady, setIsReady] = useState<boolean>(false);
-    const [error, setError] = useState<string | null>(null);
-
-    useEffect(() => {
-        function onIframeMessageReceived(e) {
-            const iframeWindow = iframeRef?.current?.contentWindow;
-            if (!iframeWindow || iframeWindow !== e.source) return;
-
-            if (e.data === "ready") {
-                setIsReady(true);
-                return;
-            } else {
-                try {
-                    const data = JSON.parse(e.data);
-                    if (data?.type === "error") {
-                        setError(data.message);
-                    }
-                } catch (e) {}
-            }
-        }
-        window.addEventListener("message", onIframeMessageReceived);
-        return () => {
-            window.removeEventListener("message", onIframeMessageReceived);
-        };
-    });
-
-    useAsync(
-        async (isReady, geoJson, isJsonString) => {
-            const iframeWindow = iframeRef?.current?.contentWindow;
-            if (!isReady || !iframeWindow) {
-                return;
-            }
-            let data = {};
-            if (isJsonString !== false) {
-                const geoJsonContent = String(geoJson).trim();
-                try {
-                    data = {};
-                    data = JSON.parse(geoJsonContent);
-                } catch (e) {
-                    try {
-                        data = JSON.parse(stripJsonComments(geoJsonContent));
-                    } catch (e) {
-                        setError(`${e}`);
-                        console.warn(
-                            "Failed to parse geoJSON: ",
-                            e,
-                            geoJsonContent
-                        );
-                    }
-                }
-            } else {
-                data = geoJson;
-            }
-            const catalogData = generate_init_data(data);
-            iframeWindow.postMessage(catalogData, "*");
-        },
-        [isReady, geoJson, isJsonString]
+    const { data: parsedData, error: parseError } = useParsedGeoJson(
+        geoJson,
+        isJsonString
     );
 
-    return (
-        <div>
-            {error ? (
-                <Message showIcon type="error">
-                    {`Failed to render GeoJson: ${error}`}
-                </Message>
-            ) : (
-                <iframe
-                    title="GeoJson Viewer"
-                    frameBorder={0}
-                    ref={iframeRef}
-                    src={
-                        config.previewMapBaseUrl +
-                        "#mode=preview&hideExplorerPanel=1&map=2d"
-                    }
-                    style={{ width: "100%", height: "500px" }}
-                />
-            )}
-        </div>
-    );
+    if (parseError) {
+        return (
+            <Message showIcon type="error">
+                {`Failed to parse GeoJSON: ${parseError}`}
+            </Message>
+        );
+    }
+
+    if (!parsedData) {
+        return null;
+    }
+
+    return <LeafletGeoJsonViewer data={parsedData} />;
 };
 
 export default GeoJsonViewer;

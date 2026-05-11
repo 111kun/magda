@@ -5,6 +5,9 @@ import URI from "urijs";
 import yargs from "yargs";
 import morgan from "morgan";
 import { createHttpTerminator } from "http-terminator";
+import fetch from "node-fetch";
+import { lookup } from "dns/promises";
+import { isIP } from "net";
 import Registry from "magda-typescript-common/src/registry/RegistryClient.js";
 import coerceJson from "magda-typescript-common/src/coerceJson.js";
 import { MAGDA_ADMIN_PORTAL_ID } from "magda-typescript-common/src/registry/TenantConsts.js";
@@ -411,6 +414,122 @@ moment.tz.setDefault(argv.defaultTimeZone);
 const app = express();
 
 app.use(morgan("combined"));
+
+function isPrivateOrReservedIp(address: string): boolean {
+    const ipVersion = isIP(address);
+    if (!ipVersion) {
+        return false;
+    }
+
+    if (ipVersion === 4) {
+        const parts = address.split(".").map((part) => Number(part));
+        const [a, b] = parts;
+        return (
+            a === 0 ||
+            a === 10 ||
+            a === 127 ||
+            (a === 100 && b >= 64 && b <= 127) ||
+            (a === 169 && b === 254) ||
+            (a === 172 && b >= 16 && b <= 31) ||
+            (a === 192 && b === 168) ||
+            (a === 198 && (b === 18 || b === 19)) ||
+            a >= 224
+        );
+    }
+
+    const normalized = address.toLowerCase();
+    return (
+        normalized === "::" ||
+        normalized === "::1" ||
+        normalized.startsWith("fc") ||
+        normalized.startsWith("fd") ||
+        normalized.startsWith("fe80:")
+    );
+}
+
+function isBlockedProxyHostname(hostname: string): boolean {
+    const host = hostname.toLowerCase();
+    return (
+        host === "localhost" ||
+        host === "localhost.localdomain" ||
+        host.endsWith(".localhost") ||
+        host.endsWith(".local") ||
+        host.endsWith(".internal")
+    );
+}
+
+async function isAllowedProxyTarget(target: string): Promise<boolean> {
+    try {
+        const u = new URL(target);
+        if (u.protocol !== "http:" && u.protocol !== "https:") return false;
+        if (u.username || u.password) return false;
+        if (u.port && u.port !== "80" && u.port !== "443") return false;
+
+        const host = u.hostname.toLowerCase();
+        if (isBlockedProxyHostname(host)) return false;
+        if (isPrivateOrReservedIp(host)) return false;
+
+        const resolved = await lookup(host, { all: true });
+        if (!resolved.length) return false;
+        return resolved.every((item) => !isPrivateOrReservedIp(item.address));
+    } catch {
+        return false;
+    }
+}
+
+app.get("/api/geo/proxy", async (req, res) => {
+    const urlParam = req.query?.url;
+    const target = Array.isArray(urlParam) ? urlParam[0] : urlParam;
+    if (typeof target !== "string" || !target) {
+        res.status(400).json({ error: "Missing `url` query parameter" });
+        return;
+    }
+    if (!(await isAllowedProxyTarget(target))) {
+        res.status(403).json({ error: "Target host not allowed" });
+        return;
+    }
+
+    const timeoutMs = 15000;
+    const maxBytes = 25 * 1024 * 1024; // 25MB
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+        const upstream = await fetch(target, {
+            headers: {
+                accept: "application/json,text/plain,*/*",
+                referer: "https://data.gov.au/",
+                "user-agent":
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
+            },
+            signal: controller.signal as any
+        });
+
+        if (!upstream.ok) {
+            res.status(upstream.status).json({
+                error: `Upstream error: ${upstream.status} ${upstream.statusText}`
+            });
+            return;
+        }
+
+        const contentType =
+            upstream.headers.get("content-type") || "application/octet-stream";
+        res.setHeader("content-type", contentType);
+        res.setHeader("cache-control", "no-store");
+
+        const buf = Buffer.from(await upstream.arrayBuffer());
+        if (buf.byteLength > maxBytes) {
+            res.status(413).json({ error: "Upstream response too large" });
+            return;
+        }
+        res.status(200).send(buf);
+    } catch (e) {
+        const msg = String(e);
+        res.status(502).json({ error: msg });
+    } finally {
+        clearTimeout(timeout);
+    }
+});
 
 app.get("/status/ready", (req, res) => {
     res.status(200).send("OK");

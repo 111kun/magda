@@ -114,6 +114,17 @@ export const createChatEventMessageCompleteMsg = (msg: string) =>
 export const createChatEventMessageErrorMsg = (error: Error | string) =>
     createChatEventMessage(EVENT_TYPE_ERROR, { error });
 
+export const createChatEventRunLogMsg = (
+    msg: string,
+    title = "System Logs",
+    optional = true
+) =>
+    createChatEventMessage(EVENT_TYPE_RUN_LOG, {
+        msg,
+        title,
+        optional
+    });
+
 export interface CommonInputType {
     question: string;
     queue: AsyncQueue<ChatEventMessage>;

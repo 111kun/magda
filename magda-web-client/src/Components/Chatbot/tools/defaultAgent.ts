@@ -17,8 +17,41 @@ import { WebLLMTool } from "../ChatWebLLM";
 const systemPromptTpl = SystemMessagePromptTemplate.fromTemplate(
     `You are a friendly AI agent named "{appName}". \n` +
         `You should greet the user and offer system usage information based on the user message and the available functions below: \n ` +
-        `{toolList}`
+        `{toolList}\n` +
+        `Current dataset context (if available):\n` +
+        `{datasetContext}`
 );
+
+function createDatasetContext(context: ChainInput): string {
+    const profile = context.keyContextData?.datasetProfile;
+    if (!profile) {
+        return "N/A";
+    }
+    const tabularSummary =
+        profile.tabular?.items?.length > 0
+            ? profile.tabular.items
+                  .map((item) => {
+                      const cols = item.columns?.slice(0, 6).join(", ");
+                      return `[tabular:${item.distributionIndex}] ${
+                          item.title
+                      } columns=${cols || "N/A"}`;
+                  })
+                  .join("\n")
+            : "N/A";
+    const spatialSummary =
+        profile.spatial?.items?.length > 0
+            ? profile.spatial.items
+                  .map((item) => {
+                      const keys = item.propertyKeys?.slice(0, 8).join(", ");
+                      const geom = item.geometryTypes?.slice(0, 4).join(", ");
+                      return `[spatial:${item.distributionIndex}] ${
+                          item.title
+                      } keys=${keys || "N/A"} geom=${geom || "N/A"}`;
+                  })
+                  .join("\n")
+            : "N/A";
+    return `tabular:\n${tabularSummary}\nspatial:\n${spatialSummary}`;
+}
 
 function createToolList(location: Location): string {
     const type = getLocationType(location);
@@ -55,7 +88,8 @@ const defaultAgent: WebLLMTool = {
 
         const stream = await defaultAgentChain.stream({
             ...context,
-            toolList: createToolList(location)
+            toolList: createToolList(location),
+            datasetContext: createDatasetContext(context)
         });
         const msgId = uuidv4();
         let partialMsgSent = false;

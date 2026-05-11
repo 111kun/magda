@@ -1,0 +1,33 @@
+.geo-json-viewer-leaflet {
+    .leaflet-popup-content {
+        margin: 10px 12px 10px 10px;
+    }
+}
+
+.magda-geojson-popup {
+    min-width: 200px;
+    max-width: 420px;
+}
+
+.magda-geojson-popup-title {
+    font-weight: 700;
+    font-size: 14px;
+    margin: 0 0 8px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid #e0e0e0;
+    color: #1a1a1a;
+}
+
+.magda-geojson-popup-json {
+    margin: 0;
+    padding: 0;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+        "Liberation Mono", "Courier New", monospace;
+    font-size: 12px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 280px;
+    overflow: auto;
+    color: #212121;
+}

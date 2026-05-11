@@ -12,11 +12,86 @@ import {
     EVENT_TYPE_PARTIAL_MSG,
     EVENT_TYPE_PARTIAL_MSG_FINISH,
     EVENT_TYPE_ERROR,
-    createChatEventMessageErrorMsg
+    createChatEventMessageErrorMsg,
+    createChatEventRunLogMsg
 } from "./Messaging";
 import { History, Location } from "history";
 import { ParsedDataset, ParsedDistribution } from "helpers/record";
 import createTools from "./tools";
+import {
+    buildDatasetProfileBase,
+    enrichSpatialProfile,
+    enrichTabularProfile,
+    makeDatasetProfileVersionKey
+} from "./datasetProfiling";
+import {
+    classifySpatialIntent,
+    SpatialIntentResult
+} from "./spatialIntentRouter";
+
+function hasGreetingIntent(question: string): boolean {
+    const text = (question || "").trim().toLowerCase();
+    if (!text) {
+        return false;
+    }
+    return /^(hi|hello|hey|你好|您好|嗨|哈喽|早上好|下午好|晚上好)\b/.test(
+        text
+    );
+}
+
+function hasDatasetDescriptionIntent(question: string): boolean {
+    const text = (question || "").toLowerCase();
+    if (!text.trim()) {
+        return false;
+    }
+    return (
+        /(当前数据集|这个数据集|数据集说明|字段|列名|样例|示例数据|统计|schema|column|columns|field|fields)/.test(
+            text
+        ) ||
+        /\b(dataset|metadata|describe|description|sample rows)\b/.test(text)
+    );
+}
+
+function hasSpatialMetadataIntent(question: string): boolean {
+    const text = (question || "").toLowerCase();
+    if (!text.trim()) {
+        return false;
+    }
+    return (
+        /(几何|空间范围|坐标系|投影|bbox|边界|覆盖范围|srid)/.test(text) ||
+        /\b(geometry|geometries|extent|bbox|srid|coverage)\b/.test(text)
+    );
+}
+
+function hasAnalysisIntent(
+    question: string,
+    confirmedSpatialIntent = false
+): boolean {
+    const text = (question || "").toLowerCase().trim();
+    if (!text) {
+        return false;
+    }
+    return (
+        confirmedSpatialIntent ||
+        /(分析|查询|统计|筛选|过滤|聚合|分组|计数|排序|top|按.*统计|计算|对比|sql)/.test(
+            text
+        ) ||
+        /\b(analy[sz]e|analysis|query|filter|where|group by|count|sum|avg|min|max|top\s*\d+|compare|sql)\b/.test(
+            text
+        )
+    );
+}
+
+function formatSpatialReferenceForLog(result: SpatialIntentResult): string {
+    const ref = result.reference;
+    if (!ref || ref.type === "none") {
+        return "reference=none";
+    }
+    if (ref.type === "internal") {
+        return `reference=internal ${ref.key}=${ref.value}`;
+    }
+    return `reference=external ${ref.place}`;
+}
 
 class AgentChain {
     static agentChain: AgentChain | null = null;
@@ -72,7 +147,10 @@ class AgentChain {
     public dataset: ParsedDataset | undefined;
     public distribution: ParsedDistribution | undefined;
     public keyContextData: KeyContextData = {
-        queryResult: undefined
+        queryResult: undefined,
+        datasetProfile: undefined,
+        datasetProfileUpdatedAt: undefined,
+        datasetProfileVersionKey: undefined
     };
     public debug: boolean = false;
     public directModelAccess: boolean = false;
@@ -233,9 +311,177 @@ class AgentChain {
         return RunnableLambda.from(async (input: ChainInput) => {
             const { queue } = input;
             try {
+                const locationType = (input?.location?.pathname || "").includes(
+                    "/dataset/"
+                )
+                    ? "DATASET_PAGE"
+                    : (input?.location?.pathname || "").includes(
+                          "/distribution/"
+                      )
+                    ? "DISTRIBUTION_PAGE"
+                    : "OTHERS";
+
+                if (locationType !== "OTHERS") {
+                    const nextVersionKey = makeDatasetProfileVersionKey(input);
+                    const hasValidProfile =
+                        input.keyContextData.datasetProfile &&
+                        input.keyContextData.datasetProfileVersionKey ===
+                            nextVersionKey;
+                    if (!hasValidProfile) {
+                        const baseProfile = buildDatasetProfileBase(input);
+                        input.keyContextData.datasetProfile = baseProfile;
+                        input.keyContextData.datasetProfileVersionKey = nextVersionKey;
+                        input.keyContextData.datasetProfileUpdatedAt = Date.now();
+                    }
+                    const profile = input.keyContextData.datasetProfile;
+                    if (profile && profile.tabular.status === "not_loaded") {
+                        await enrichTabularProfile(input, profile);
+                        input.keyContextData.datasetProfileUpdatedAt = Date.now();
+                    }
+                    if (profile && profile.spatial.status === "not_loaded") {
+                        await enrichSpatialProfile(input, profile);
+                        input.keyContextData.datasetProfileUpdatedAt = Date.now();
+                    }
+                }
+
+                let spatialIntentResult: SpatialIntentResult = {
+                    route: "unknown",
+                    confidence: 0,
+                    reason: "Spatial router was not run.",
+                    source: "fallback",
+                    reference: { type: "none" }
+                };
+                if (
+                    locationType !== "OTHERS" &&
+                    !hasGreetingIntent(input.question)
+                ) {
+                    spatialIntentResult = await classifySpatialIntent(input);
+                    (input as ChainInput & {
+                        __geoIntent?: SpatialIntentResult;
+                    }).__geoIntent = spatialIntentResult;
+                    queue.push(
+                        createChatEventRunLogMsg(
+                            `Spatial router: ${spatialIntentResult.route} (${
+                                spatialIntentResult.source
+                            }, confidence=${spatialIntentResult.confidence.toFixed(
+                                2
+                            )}, ${formatSpatialReferenceForLog(
+                                spatialIntentResult
+                            )}). ${spatialIntentResult.reason}`,
+                            "System Logs"
+                        )
+                    );
+                    if (this.debug) {
+                        console.log(
+                            "spatial intent route:",
+                            spatialIntentResult
+                        );
+                    }
+                }
+                const confirmedSpatialIntent =
+                    spatialIntentResult.route === "spatial";
+
                 const tools = await createTools(input);
                 if (this.debug) {
                     console.log("available tools: ", tools);
+                }
+
+                const geoTool = tools.find(
+                    (tool) => tool?.name === "queryGeoDataset"
+                );
+                const queryDatasetTool = tools.find(
+                    (tool) => tool?.name === "queryDataset"
+                );
+                const defaultAgentTool = tools.find(
+                    (tool) => tool?.name === "defaultAgent"
+                );
+
+                if (locationType !== "OTHERS") {
+                    if (
+                        (hasGreetingIntent(input.question) ||
+                            (spatialIntentResult.route === "non_spatial" &&
+                                !hasAnalysisIntent(input.question, false))) &&
+                        defaultAgentTool
+                    ) {
+                        const defaultValue = await defaultAgentTool.func.call(
+                            input
+                        );
+                        if (
+                            typeof defaultValue !== "undefined" &&
+                            defaultValue !== null
+                        ) {
+                            return `${defaultValue}`;
+                        }
+                        return;
+                    }
+
+                    if (confirmedSpatialIntent && geoTool) {
+                        const geoValue = await geoTool.func.call(input);
+                        if (
+                            typeof geoValue !== "undefined" &&
+                            geoValue !== null
+                        ) {
+                            return `${geoValue}`;
+                        }
+                        return;
+                    }
+
+                    if (
+                        spatialIntentResult.route !== "unknown" &&
+                        hasAnalysisIntent(
+                            input.question,
+                            confirmedSpatialIntent
+                        ) &&
+                        queryDatasetTool
+                    ) {
+                        const sqlValue = await queryDatasetTool.func.call(
+                            input
+                        );
+                        if (
+                            typeof sqlValue !== "undefined" &&
+                            sqlValue !== null
+                        ) {
+                            return `${sqlValue}`;
+                        }
+                        return;
+                    }
+
+                    if (
+                        spatialIntentResult.route !== "unknown" &&
+                        defaultAgentTool
+                    ) {
+                        const defaultValue = await defaultAgentTool.func.call(
+                            input
+                        );
+                        if (
+                            typeof defaultValue !== "undefined" &&
+                            defaultValue !== null
+                        ) {
+                            return `${defaultValue}`;
+                        }
+                        return;
+                    }
+                }
+
+                if (
+                    locationType === "OTHERS" &&
+                    !hasGreetingIntent(input.question)
+                ) {
+                    const searchTool = tools.find(
+                        (tool) => tool?.name === "searchDatasets"
+                    );
+                    if (searchTool) {
+                        const searchValue = await searchTool.func.call(
+                            input,
+                            input.question
+                        );
+                        if (
+                            typeof searchValue !== "undefined" &&
+                            searchValue !== null
+                        ) {
+                            return `${searchValue}`;
+                        }
+                    }
                 }
                 const result = await this.model.invokeTool(
                     input.question,

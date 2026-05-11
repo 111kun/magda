@@ -7,7 +7,17 @@ import { runQuery } from "../../../libs/sqlUtils";
 import { WebLLMTool } from "../ChatWebLLM";
 import { createQueryDataFilesWithSQLQueryTool } from "./queryDataFilesWithSQLQuery";
 
-const SUPPORT_FORMATS = ["CSV-GEO-AU", "CSV"];
+const SUPPORT_FORMATS = [
+    "CSV-GEO-AU",
+    "CSV",
+    "TSV",
+    "TAB",
+    "XLS",
+    "XLSX",
+    "JSON",
+    "JSONL",
+    "NDJSON"
+];
 
 export async function getDistColumnNames(
     distIdx: number
@@ -46,8 +56,22 @@ export async function createQueryDatasetTool(
     if (!dists.length) {
         return null;
     }
+    const profileByIdx =
+        input.keyContextData?.datasetProfile?.tabular?.items?.reduce(
+            (acc, item) => {
+                acc[item.distributionIndex] = item.columns || [];
+                return acc;
+            },
+            {} as Record<number, string[]>
+        ) || {};
     const distTitleList = dists
-        .map((item) => `- ${item.dist.title}`)
+        .map((item) => {
+            const sampleCols = profileByIdx[item.idx] || [];
+            const sample = sampleCols.length
+                ? ` | sample columns: ${sampleCols.slice(0, 8).join(", ")}`
+                : "";
+            return `- ${item.dist.title}${sample}`;
+        })
         .join("\n");
     async function queryDataset(this: ChainInput) {
         this.queue.push(

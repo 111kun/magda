@@ -1,0 +1,389 @@
+/**
+ * Prompt description builders for GeoSQL tool:
+ * - Compose per-distribution YAML metadata blocks
+ * - Assemble the final tool description with constraints/examples
+ */
+import { ParsedDataset, ParsedDistribution } from "helpers/record";
+import toYaml from "libs/toYaml";
+import { SpatialProfileItem } from "../../commons";
+import {
+    importSpatialFromDistribution,
+    runPostgisQuery
+} from "../../../../libs/pglitePostgis";
+import { getDistributionUrl } from "./distribution";
+import {
+    PropertySchemaBinding,
+    formatPropertySchemaForDescription,
+    getGeoDistributionSampleHint,
+    sampleGeoPropertySchema
+} from "./schema";
+
+type GeometryProfile = {
+    status: "ok" | "sampling_failed";
+    families: string[];
+    sampled_feature_count: number;
+    message?: string;
+};
+
+type GeoFileProfile = {
+    id: number;
+    title: string;
+    format: string;
+    schema_binding: {
+        note: string;
+        features_virtual_table: {
+            id: string;
+            properties: string;
+            geom: string;
+        };
+        properties_schema: PropertySchemaBinding;
+        geometry_profile: GeometryProfile;
+    };
+    sample_row_hint?: string;
+    sample?: string;
+};
+
+function truncateText(input: string, maxLen: number): string {
+    const txt = (input || "").trim();
+    if (!txt) {
+        return "";
+    }
+    return txt.length > maxLen ? `${txt.slice(0, maxLen)}...` : txt;
+}
+
+function buildDatasetMetadataBrief(
+    dataset: ParsedDataset | undefined,
+    distItems: { idx: number; dist: ParsedDistribution }[]
+): string {
+    const lines: string[] = [];
+    if (dataset) {
+        lines.push(`dataset_title: ${dataset.title || "n/a"}`);
+        lines.push(
+            `dataset_description: ${
+                truncateText(dataset.description || "", 260) || "n/a"
+            }`
+        );
+        lines.push(
+            `dataset_themes: ${
+                dataset.themes?.length ? dataset.themes.join(", ") : "n/a"
+            }`
+        );
+        lines.push(
+            `dataset_tags: ${
+                dataset.tags?.length ? dataset.tags.join(", ") : "n/a"
+            }`
+        );
+        lines.push(`dataset_publisher: ${dataset.publisher?.name || "n/a"}`);
+    }
+    const distMeta = distItems.slice(0, 3).map((item) => ({
+        id: item.idx,
+        title: item.dist.title,
+        format: item.dist.format,
+        description: truncateText(item.dist.description || "", 180) || "n/a"
+    }));
+    lines.push(`distribution_metadata: ${toYaml(distMeta).trim()}`);
+    return lines.join("\n");
+}
+
+async function buildGeoFileProfiles(
+    distItems: { idx: number; dist: ParsedDistribution }[]
+): Promise<GeoFileProfile[]> {
+    const profiles: GeoFileProfile[] = [];
+    const samplePreviewLimit = 2;
+    for (let i = 0; i < distItems.length; i++) {
+        const id = distItems[i].idx;
+        const dist = distItems[i].dist;
+        const sampleHint =
+            i < samplePreviewLimit
+                ? await getGeoDistributionSampleHint(dist)
+                : null;
+        let sampledPropertySchema: PropertySchemaBinding = {
+            status: "sampling_failed",
+            message: "Property schema not sampled for this file."
+        };
+        let geometryProfile: GeometryProfile = {
+            status: "sampling_failed",
+            families: [],
+            sampled_feature_count: 0,
+            message: "Geometry profile not sampled for this file."
+        };
+        if (i < samplePreviewLimit) {
+            try {
+                await importSpatialFromDistribution(
+                    getDistributionUrl(dist) || "",
+                    dist.format,
+                    dist.title
+                );
+                const geomRows = await runPostgisQuery(
+                    `SELECT GeometryType(geom) AS geom_type
+                     FROM features
+                     WHERE geom IS NOT NULL
+                     LIMIT 50`
+                );
+                const families = new Set<string>();
+                for (const row of geomRows || []) {
+                    families.add(
+                        normalizeGeomFamily(String(row?.geom_type || ""))
+                    );
+                }
+                geometryProfile = {
+                    status: "ok",
+                    families: [...families].sort(),
+                    sampled_feature_count: geomRows?.length || 0
+                };
+                const propertySchema = await sampleGeoPropertySchema();
+                sampledPropertySchema = formatPropertySchemaForDescription(
+                    propertySchema
+                );
+            } catch {
+                sampledPropertySchema = {
+                    status: "sampling_failed",
+                    message: "Property schema sampling failed for this file."
+                };
+                geometryProfile = {
+                    status: "sampling_failed",
+                    families: [],
+                    sampled_feature_count: 0,
+                    message: "Geometry profile sampling failed for this file."
+                };
+            }
+        }
+        profiles.push({
+            id,
+            title: dist.title,
+            format: dist.format,
+            schema_binding: {
+                note:
+                    "Select this id as distributionIndex before running GeoSQL.",
+                features_virtual_table: {
+                    id: "serial",
+                    properties: "jsonb",
+                    geom: "geometry (usually SRID 4326)"
+                },
+                properties_schema: sampledPropertySchema,
+                geometry_profile: geometryProfile
+            },
+            ...(sampleHint
+                ? {
+                      sample_row_hint:
+                          "Use this real sample row to infer SQL field access and geometry handling.",
+                      sample: sampleHint
+                  }
+                : {})
+        });
+    }
+    return profiles;
+}
+
+async function buildGeoFileProfilesFromSpatialProfile(
+    distItems: { idx: number; dist: ParsedDistribution }[],
+    spatialProfileItems: SpatialProfileItem[]
+): Promise<GeoFileProfile[]> {
+    const profileByIdx = new Map<number, SpatialProfileItem>();
+    spatialProfileItems.forEach((item) =>
+        profileByIdx.set(item.distributionIndex, item)
+    );
+    const profiles: GeoFileProfile[] = [];
+    for (let i = 0; i < distItems.length; i++) {
+        const { idx, dist } = distItems[i];
+        const profile = profileByIdx.get(idx);
+        const geomFamilies = (profile?.geometryTypes || [])
+            .map((item) => normalizeGeomFamily(item.type))
+            .filter((value, index, array) => array.indexOf(value) === index);
+        const keys = profile?.propertyKeys || [];
+        const propertiesSchema: PropertySchemaBinding = keys.length
+            ? {
+                  status: "ok",
+                  existing_keys: keys,
+                  fields: keys.map((key) => ({
+                      key,
+                      inferred_type: "mixed",
+                      sample_value: "",
+                      recommended_accessor: `properties->>'${key}'`
+                  }))
+              }
+            : {
+                  status: "empty",
+                  message: "No profiled keys found in datasetProfile."
+              };
+        const sampleHint =
+            i < 2 ? await getGeoDistributionSampleHint(dist) : null;
+        profiles.push({
+            id: idx,
+            title: dist.title,
+            format: dist.format,
+            schema_binding: {
+                note:
+                    "Select this id as distributionIndex before running GeoSQL.",
+                features_virtual_table: {
+                    id: "serial",
+                    properties: "jsonb",
+                    geom: "geometry (usually SRID 4326)"
+                },
+                properties_schema: propertiesSchema,
+                geometry_profile: {
+                    status:
+                        profile?.geometryTypes?.length || profile?.bboxWkt
+                            ? "ok"
+                            : "sampling_failed",
+                    families: geomFamilies.length ? geomFamilies : [],
+                    sampled_feature_count:
+                        (profile?.geometryTypes || []).reduce(
+                            (acc, item) => acc + (item.count || 0),
+                            0
+                        ) || 0,
+                    message:
+                        !profile || profile.status === "failed"
+                            ? "Geometry profile unavailable in datasetProfile."
+                            : undefined
+                }
+            },
+            ...(sampleHint
+                ? {
+                      sample_row_hint:
+                          "Use this real sample row to infer SQL field access and geometry handling.",
+                      sample: sampleHint
+                  }
+                : {})
+        });
+    }
+    return profiles;
+}
+
+function buildGeoDatasetIntroContextFromProfiles(
+    profiles: GeoFileProfile[],
+    metadataBrief?: string
+): string | null {
+    if (!profiles.length) {
+        return null;
+    }
+    const previewProfiles = profiles.slice(0, 2);
+    const lines = previewProfiles.map((profile) => {
+        const geomFamilies = profile.schema_binding.geometry_profile.families
+            .length
+            ? profile.schema_binding.geometry_profile.families.join(", ")
+            : "unknown";
+        const propSchema = profile.schema_binding.properties_schema;
+        const fields =
+            propSchema.status === "ok"
+                ? propSchema.existing_keys.slice(0, 12).join(", ")
+                : "n/a";
+        return `- [${profile.id}] ${profile.title}: geometry=${geomFamilies}; fields=${fields}`;
+    });
+    return [metadataBrief, "Spatial file summary:", lines.join("\n")]
+        .filter((part) => !!part)
+        .join("\n");
+}
+
+export async function buildGeoFileDescriptions(
+    distItems: { idx: number; dist: ParsedDistribution }[]
+): Promise<string[]> {
+    const profiles = await buildGeoFileProfiles(distItems);
+    return profiles.map((profile) => toYaml(profile));
+}
+
+export async function buildGeoFileDescriptionsAndIntro(
+    distItems: { idx: number; dist: ParsedDistribution }[],
+    dataset?: ParsedDataset,
+    spatialProfileItems?: SpatialProfileItem[]
+): Promise<{
+    fileDescItems: string[];
+    introContext: string | null;
+    metadataBrief: string;
+}> {
+    const profiles =
+        spatialProfileItems?.length && spatialProfileItems.length > 0
+            ? await buildGeoFileProfilesFromSpatialProfile(
+                  distItems,
+                  spatialProfileItems
+              )
+            : await buildGeoFileProfiles(distItems);
+    const metadataBrief = buildDatasetMetadataBrief(dataset, distItems);
+    return {
+        fileDescItems: profiles.map((profile) => toYaml(profile)),
+        introContext: buildGeoDatasetIntroContextFromProfiles(
+            profiles,
+            metadataBrief
+        ),
+        metadataBrief
+    };
+}
+
+function normalizeGeomFamily(
+    geomType: string
+): "point" | "line" | "polygon" | "other" {
+    const txt = (geomType || "").toUpperCase();
+    if (txt.includes("POINT")) return "point";
+    if (txt.includes("LINE")) return "line";
+    if (txt.includes("POLYGON")) return "polygon";
+    return "other";
+}
+
+export async function buildGeoDatasetIntroContext(
+    distItems: { idx: number; dist: ParsedDistribution }[]
+): Promise<string | null> {
+    const profiles = await buildGeoFileProfiles(distItems);
+    return buildGeoDatasetIntroContextFromProfiles(profiles);
+}
+
+export function buildGeoSqlToolDescription(
+    fileDescItems: string[],
+    metadataBrief?: string
+): string {
+    return (
+        "Execute PostGIS SQL against spatial data loaded into a local PGlite database. " +
+        "First pick a spatial file by distributionIndex, then supply a single GeoSQL statement.\n" +
+        "Strict output contract for the sqlQuery argument:\n" +
+        "- The sqlQuery string MUST contain executable SQL only and MUST start directly with SELECT or WITH.\n" +
+        "- Do NOT include apologies, natural-language explanations, markdown fences, JSON wrappers, labels, comments, or text before/after the SQL.\n" +
+        "- Invalid example: `Apologies... ```sql SELECT ...``` `. Valid example: `SELECT ... FROM features LIMIT 100`.\n" +
+        (metadataBrief
+            ? "Dataset metadata context (use this to understand entity meaning before writing SQL):\n" +
+              metadataBrief +
+              "\n"
+            : "") +
+        "To generate a valid GeoSQL, follow these steps:\n" +
+        "1) Identify the geometry type (Point/Line/Polygon).\n" +
+        "2) Check if a distance calculation is needed. If yes, MUST use ::geography for meter units.\n" +
+        "3) Inspect the properties JSONB keys provided in the sample. Use ->> for text filters and (properties->>'key')::float for numeric filters.\n" +
+        "4) Ensure SRID 4326 is used for any new point creation.\n" +
+        "Schema Metadata (deterministic binding):\n" +
+        "- After import, data lives in virtual table `features(id serial, properties jsonb, geom geometry)`.\n" +
+        "- `features` is the ONLY SQL table name available in the browser PostGIS database; never use dataset titles, distribution titles, filenames, or derived names as table names.\n" +
+        "- `properties` keys are case-sensitive in JSONB; do not change key casing.\n" +
+        "- MUST use only keys listed in YAML `schema_binding.properties_schema.existing_keys`; do not invent or normalize key names.\n" +
+        "- Use the provided `properties_schema` and sampled key list to bind SQL fields exactly.\n" +
+        "Execution Rules:\n" +
+        "For place-distance queries, provide `placeName` and use token `__REF_POINT__` in SQL. " +
+        "The tool resolves place coordinates by searching current dataset first; if not found, it falls back to OpenStreetMap Nominatim.\n" +
+        "For nearest-to-dataset-feature queries where the reference point is identified by an existing column/key and value (e.g. id=12, street='King Street', species='Oak'), do NOT use `placeName` or `__REF_POINT__`; use a CTE/self-join against `features` to select the reference row.\n" +
+        "Only use `placeName`/`__REF_POINT__` when the reference point is not expressed as an existing dataset column/key filter.\n" +
+        "GeoSQL guidelines:\n" +
+        "- When feasible, include `ST_AsText(geom) AS geom_wkt` for map rendering compatibility.\n" +
+        "- Unless user explicitly requests raw geometry/GeoJSON, do not return raw `geom`; prefer WKT output.\n" +
+        "- If you use `GeometryType(...)` filters, compare against UPPERCASE literals only (e.g. 'POINT', 'LINESTRING', 'POLYGON', 'MULTIPOLYGON').\n" +
+        "- For JSONB properties access, key name MUST match YAML exactly (case-sensitive), e.g. use `properties->>'Name'` if YAML key is `Name`.\n" +
+        "- If SQL uses GROUP BY, every non-grouped selected expression MUST be aggregated; never select raw `geom` or plain `ST_Area(geom)` in grouped queries.\n" +
+        "- Area calculations MUST be in square meters using geography (e.g. `ST_Area(geom::geography)`), and length/distance MUST be in meters using geography.\n" +
+        "- For one-to-many name relationships (same Name appears on multiple features), explicitly choose logic: aggregate (e.g. `SUM(ST_Area(geom::geography))`) or keep feature-level rows. Do not mix both ambiguously.\n" +
+        "- Match natural-language variants and common misspellings using metadata context (e.g. `kindergarden` ~= `kindergarten`) before deciding filters.\n" +
+        "- Prefer typed access for numeric/boolean/object/array keys: `properties->'FieldName'`; cast as needed (e.g. (properties->>'count')::numeric).\n" +
+        "- Use `properties->>'FieldName'` for plain text comparisons/output.\n" +
+        "- For distance/length in meters, cast to geography (e.g. ST_Length(geom::geography), ST_DWithin(...::geography,...::geography, meters)).\n" +
+        "- Prefer robust line filters: GeometryType(geom) IN ('LINESTRING','MULTILINESTRING') OR ST_Dimension(geom)=1. Avoid only checking one exact type.\n" +
+        "- For polygon operations, handle MULTIPOLYGON as well.\n" +
+        "Examples:\n" +
+        "- Attributes: SELECT properties->>'name' AS n, ST_AsText(geom) FROM features LIMIT 100\n" +
+        "- Distance in meters (WGS84): SELECT * FROM features WHERE ST_DWithin(geom::geography, ST_SetSRID(ST_MakePoint(151.0, -33.86),4326)::geography, 5000) LIMIT 100\n" +
+        "- Distance using place token: SELECT properties->>'Figure_Description' AS name FROM features WHERE ST_DWithin(geom::geography, __REF_POINT__::geography, 5000) LIMIT 100\n" +
+        "- Line length (meters): SELECT id, ST_Length(geom::geography) AS length_m FROM features WHERE GeometryType(geom) IN ('LINESTRING','MULTILINESTRING') LIMIT 100\n" +
+        "Common spatial query patterns (few-shot templates):\n" +
+        "- Buffer/proximity query: SELECT id, properties->>'name' AS name FROM features WHERE ST_DWithin(geom::geography, __REF_POINT__::geography, 1000) LIMIT 100\n" +
+        "- Attribute aggregation: SELECT properties->>'category' AS category, COUNT(*) AS total FROM features GROUP BY 1 ORDER BY total DESC LIMIT 100\n" +
+        "- Aggregated area by name (sqm): SELECT properties->>'Name' AS area_name, SUM(ST_Area(geom::geography)) AS area_m2 FROM features WHERE UPPER(GeometryType(geom)) IN ('POLYGON','MULTIPOLYGON') GROUP BY properties->>'Name' ORDER BY area_m2 DESC LIMIT 100\n" +
+        "- Nearest-neighbor query: SELECT id, properties->>'name' AS name, ST_Distance(geom::geography, __REF_POINT__::geography) AS distance_m FROM features ORDER BY geom <-> __REF_POINT__ LIMIT 5\n" +
+        "- Complex numeric filter: SELECT id, properties->>'name' AS name FROM features WHERE (properties->>'population')::int > 1000 LIMIT 100\n" +
+        "Available spatial files — set distributionIndex to the `id` value (same indexing as SQL Console source()):\n" +
+        fileDescItems.join("\n")
+    );
+}

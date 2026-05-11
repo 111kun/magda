@@ -80,3 +80,10 @@
 .magda-sql-console-cell-content-with-tooltip {
     cursor: pointer;
 }
+
+.magda-sql-console-open-button {
+    position: fixed;
+    left: 16px;
+    bottom: 16px;
+    z-index: 1050;
+}

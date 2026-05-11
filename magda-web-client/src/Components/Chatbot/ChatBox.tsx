@@ -276,11 +276,13 @@ const ChatBox: FunctionComponent<PropsType> = (props) => {
                                     the limit. You can increase the limit to
                                     allow the Chatbot to process more data.
                                     However, it will requires more memory
-                                    (default 4096 tokens context window requires
+                                    (default 8192 tokens context window requires
                                     roughly 5GB VRAM) and take much longer (2x
                                     the context windows would increase process
                                     time by 4x) to process depends on your
-                                    hardware.
+                                    hardware. The selector supports up to 128k
+                                    tokens, but larger windows can significantly
+                                    increase latency and memory usage.
                                 </Tooltip>
                             }
                         >

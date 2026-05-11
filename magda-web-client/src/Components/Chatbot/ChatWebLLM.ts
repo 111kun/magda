@@ -89,16 +89,28 @@ export const contextWindowOptions: ContextWindowOption[] = [
     },
     {
         label: "4k tokens",
-        default: true,
         value: 4096
     },
     {
-        label: "6k tokens",
-        value: 6144
+        label: "8k tokens",
+        default: true,
+        value: 8192
     },
     {
-        label: "8k tokens",
-        value: 8192
+        label: "16k tokens",
+        value: 16384
+    },
+    {
+        label: "32k tokens",
+        value: 32768
+    },
+    {
+        label: "64k tokens",
+        value: 65536
+    },
+    {
+        label: "128k tokens",
+        value: 131072
     }
 ];
 
@@ -108,10 +120,10 @@ const defaultContextWindowSizeOption = contextWindowOptions.find(
 
 export const defaultContextWindowSize = defaultContextWindowSizeOption?.value
     ? defaultContextWindowSizeOption.value
-    : 4096;
+    : 8192;
 
 const DEFAULT_MODEL_CONFIG: WebLLMInputs = {
-    model: "Hermes-2-Pro-Llama-3-8B-q4f16_1-MLC",
+    model: "Hermes-3-Llama-3.1-8B-q4f16_1-MLC",
     chatOptions: {
         temperature: 0,
         context_window_size: defaultContextWindowSize
@@ -310,6 +322,50 @@ export default class ChatWebLLM extends SimpleChatModel<WebLLMCallOptions> {
         tools: WebLLMTool[],
         thisObj: any = undefined
     ): Promise<WebLLMToolCallResult<T> | undefined> {
+        const makeFallbackResult = (
+            text: string
+        ): WebLLMToolCallResult<T> | undefined => {
+            const value = text?.trim();
+            if (!value) {
+                return undefined;
+            }
+            return {
+                name: "__fallback_text__",
+                value: value as T
+            };
+        };
+        const extractOutputMessageFromError = (
+            rawErr: unknown
+        ): string | null => {
+            const text = String(rawErr || "");
+            const marker = "Got outputMessage:";
+            const markerIdx = text.indexOf(marker);
+            if (markerIdx === -1) {
+                return null;
+            }
+            const after = text.slice(markerIdx + marker.length).trim();
+            const endMarker = "\nGot error:";
+            const endIdx = after.indexOf(endMarker);
+            return (endIdx === -1 ? after : after.slice(0, endIdx)).trim();
+        };
+        const availableToolNames = tools.map((item) => item.name).join(", ");
+        const toolCallSystemInstruction =
+            "You are a tool-using assistant for the Magda platform. " +
+            "When tools are provided, prefer calling a relevant tool whenever the user asks for dataset/distribution data, metadata, SQL analysis, or spatial analysis. " +
+            "For pure greeting/chitchat/help text that does not require data access, plain-text reply is allowed. " +
+            "Use spatial SQL tool only for spatial analysis intent (distance, nearby, intersection, within, buffer, geometry filters). " +
+            "For queryGeoSpatialWithSQLQuery, you MUST provide required arguments: distributionIndex (integer) and sqlQuery (valid PostGIS SQL against table features). " +
+            "For queryGeoSpatialWithSQLQuery.sqlQuery, provide executable SQL only and start directly with SELECT or WITH; never include apologies, prose, markdown code fences, labels, comments, or text before/after the SQL. " +
+            "Optional arguments: placeName and countrycodes. " +
+            "For current dataset/distribution metadata questions (e.g. fields, columns, dataset description, sample data), prefer queryDataset when available; otherwise use defaultAgent. " +
+            "For greeting/help/system usage, use defaultAgent when available. " +
+            "Do not output SQL explanations in message content when calling tools. " +
+            "Do not invent table names or fields; the query table is features after importing the selected spatial distribution. " +
+            "If required arguments cannot be inferred, ask a concise clarification question via tool result text. " +
+            "When calling a tool, the tool arguments must be strict valid JSON object only (double quotes, no comments, no trailing commas). " +
+            'Never print pseudo tool-call payloads in message content (for example JSON like {"name":...,"arguments":...}, XML tags, or markdown code blocks). ' +
+            "Use exact tool names only. Available tool names: " +
+            availableToolNames;
         const toolDefs = tools.map((item) => {
             const { func, parameters, requiredParameters, ...def } = item;
             const functionDef: webllm.FunctionDefinition = {
@@ -336,20 +392,45 @@ export default class ChatWebLLM extends SimpleChatModel<WebLLMCallOptions> {
         });
         const request: webllm.ChatCompletionRequest = {
             stream: false,
-            messages:
-                typeof userMessage === "string"
+            messages: [
+                {
+                    role: "system",
+                    content: toolCallSystemInstruction
+                },
+                ...(typeof userMessage === "string"
                     ? [
                           {
-                              role: "user",
+                              role: "user" as const,
                               content: userMessage
                           }
                       ]
-                    : [userMessage],
+                    : [userMessage])
+            ],
             tool_choice: "auto",
             tools: toolDefs
         };
         const engine = await this.getEngine();
-        const reply = await engine.chat.completions.create(request);
+        let reply: webllm.ChatCompletion | undefined;
+        try {
+            reply = await engine.chat.completions.create(request);
+        } catch (e) {
+            const msg = String(e || "");
+            // Some models may output plain assistant text in tool-call mode,
+            // which can trigger parser errors inside the engine. Gracefully
+            // fall back instead of crashing the whole chat flow.
+            if (
+                msg.includes("ToolCallOutputParseError") ||
+                msg.includes("not valid JSON")
+            ) {
+                const outputMessage = extractOutputMessageFromError(e);
+                console.warn(
+                    "invokeTool fallback: model returned non-tool text in tool-call mode.",
+                    e
+                );
+                return makeFallbackResult(outputMessage || "");
+            }
+            throw e;
+        }
         const finish_reason = reply?.choices?.[0]?.finish_reason;
         switch (finish_reason) {
             case "length":
@@ -366,13 +447,30 @@ export default class ChatWebLLM extends SimpleChatModel<WebLLMCallOptions> {
                 );
         }
         if (!reply?.choices?.[0]?.message?.tool_calls?.length) {
+            const plainText = reply?.choices?.[0]?.message?.content;
+            if (typeof plainText === "string" && plainText.trim()) {
+                return makeFallbackResult(plainText);
+            }
             return undefined;
         }
         const toolCall = reply.choices[0].message.tool_calls[0].function;
         const funcName = toolCall.name;
-        const funcArgsObj: Record<string, any> = toolCall?.arguments?.length
-            ? JSON.parse(toolCall.arguments)
-            : {};
+        let funcArgsObj: Record<string, any> = {};
+        if (toolCall?.arguments?.length) {
+            try {
+                funcArgsObj = JSON.parse(toolCall.arguments);
+            } catch (e) {
+                console.warn(
+                    "invokeTool fallback: tool arguments are not valid JSON.",
+                    toolCall.arguments
+                );
+                const plainText = reply?.choices?.[0]?.message?.content;
+                if (typeof plainText === "string" && plainText.trim()) {
+                    return makeFallbackResult(plainText);
+                }
+                return undefined;
+            }
+        }
         const toolCalled = tools.find((tool) => tool.name === funcName);
         if (!toolCalled) {
             throw new Error(

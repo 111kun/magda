@@ -5,6 +5,58 @@ import ChatWebLLM from "./ChatWebLLM";
 import { ParsedDataset, ParsedDistribution } from "helpers/record";
 export type LocationType = "DATASET_PAGE" | "DISTRIBUTION_PAGE" | "OTHERS";
 
+export type GeometryTypeCount = {
+    type: string;
+    count: number;
+};
+
+export interface TabularProfileItem {
+    distributionIndex: number;
+    title: string;
+    format: string;
+    columns?: string[];
+    sampleRows?: Record<string, any>[];
+    rowCount?: number;
+    error?: string;
+}
+
+export interface SpatialProfileItem {
+    distributionIndex: number;
+    title: string;
+    format: string;
+    status?: "ready" | "error" | "failed" | "not_loaded";
+    geometryTypes?: GeometryTypeCount[];
+    propertyKeys?: string[];
+    sampledFeatureCount?: number;
+    sampleRows?: Record<string, any>[];
+    bbox?: [number, number, number, number];
+    bboxWkt?: string;
+    error?: string;
+}
+
+type ProfileStatus = "ready" | "error";
+
+export interface DatasetProfile {
+    versionKey: string;
+    locationType: LocationType;
+    datasetIdentifier?: string;
+    datasetTitle?: string;
+    datasetDescription?: string;
+    datasetTags?: string[];
+    datasetThemes?: string[];
+    distributionCount: number;
+    tabular: {
+        status: "not_loaded" | ProfileStatus;
+        items: TabularProfileItem[];
+        updatedAt?: number;
+    };
+    spatial: {
+        status: "not_loaded" | ProfileStatus;
+        items: SpatialProfileItem[];
+        updatedAt?: number;
+    };
+}
+
 /**
  * Store information might be useful for future message generation.
  * e.g. User might ask "Draw the results as a chart".
@@ -16,6 +68,9 @@ export type LocationType = "DATASET_PAGE" | "DISTRIBUTION_PAGE" | "OTHERS";
 export interface KeyContextData {
     // latest query result
     queryResult: any;
+    datasetProfile?: DatasetProfile;
+    datasetProfileUpdatedAt?: number;
+    datasetProfileVersionKey?: string;
 }
 
 export interface ChainInput {

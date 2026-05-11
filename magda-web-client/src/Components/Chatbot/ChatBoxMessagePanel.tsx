@@ -16,10 +16,12 @@ import {
     EVENT_TYPE_ERROR,
     EVENT_TYPE_PARTIAL_MSG_FINISH,
     EVENT_TYPE_PING,
+    EVENT_TYPE_RUN_LOG_FINISH,
     NoErrorStop,
     STREAM_TYPE,
     STREAM_TYPE_AGENT_STEP,
     STREAM_TYPE_PARTIAL_MSG,
+    STREAM_TYPE_RUN_LOG,
     STREAM_TYPE_UNDEFINED,
     getStreamType,
     ChatEventMessage,
@@ -227,19 +229,21 @@ const ChatBoxMessagePanel: FunctionComponent<PropsType> = (props) => {
                 throw new NoErrorStop();
             }
 
-            if (
-                eventMessage.event === EVENT_TYPE_COMPLETE_MSG &&
-                eventMessage?.data?.msg
-            ) {
-                addMessage(messageQueueRef, {
-                    type: "bot",
-                    content: eventMessage?.data?.msg,
-                    optional:
-                        typeof eventMessage?.data?.optional === "boolean"
-                            ? eventMessage.data.optional
-                            : false
-                });
-                setDataReloadToken(Math.random().toString());
+            if (eventMessage.event === EVENT_TYPE_COMPLETE_MSG) {
+                if (eventMessage?.data?.msg) {
+                    addMessage(messageQueueRef, {
+                        type: "bot",
+                        content: eventMessage.data.msg,
+                        optional:
+                            typeof eventMessage?.data?.optional === "boolean"
+                                ? eventMessage.data.optional
+                                : false
+                    });
+                    setDataReloadToken(Math.random().toString());
+                }
+                // Always return: empty complete_msg must not fall through to the
+                // stream switch (would yield STREAM_TYPE_COMPLETE_MSG / undefined
+                // and previously crashed the panel).
                 return;
             }
 
@@ -327,8 +331,35 @@ const ChatBoxMessagePanel: FunctionComponent<PropsType> = (props) => {
                         setDataReloadToken(Math.random().toString());
                     }
                     break;
+                case STREAM_TYPE_RUN_LOG:
+                    if (eventMessage.event === EVENT_TYPE_RUN_LOG_FINISH) {
+                        resetMessageProcessingStatus();
+                        return;
+                    }
+                    if (eventMessage?.data?.msg) {
+                        addMessage(messageQueueRef, {
+                            type: "bot",
+                            content: String(eventMessage.data.msg),
+                            optional:
+                                typeof eventMessage?.data?.optional ===
+                                "boolean"
+                                    ? eventMessage.data.optional
+                                    : true
+                        });
+                        setDataReloadToken(Math.random().toString());
+                    }
+                    break;
+                case STREAM_TYPE_UNDEFINED:
+                    // Benign or out-of-band events; do not crash the panel.
+                    return;
                 default:
-                    throw new Error(`Unsupported stream type: ${streamType}`);
+                    console.warn(
+                        "Unsupported stream type:",
+                        eventStreamType,
+                        "refStreamType:",
+                        streamType
+                    );
+                    return;
             }
             setDataReloadToken(Math.random().toString());
         },

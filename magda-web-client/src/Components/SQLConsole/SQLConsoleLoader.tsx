@@ -10,6 +10,7 @@ import {
 import { useAsync } from "react-async-hook";
 import reportError from "helpers/reportError";
 import Loader from "rsuite/Loader";
+import Button from "rsuite/Button";
 import type SQLConsoleTypeImport from "./SQLConsole";
 import { ParsedDataset, ParsedDistribution } from "helpers/record";
 import {
@@ -114,6 +115,14 @@ const SQLConsoleLoader: FunctionComponent<PropsType> = (props) => {
         <>
             {enableSqlConsole ? (
                 <>
+                    <Button
+                        className="magda-sql-console-open-button"
+                        appearance="primary"
+                        size="sm"
+                        onClick={() => dispatch(toggleIsOpen())}
+                    >
+                        SQL Console
+                    </Button>
                     {SQLConsole ? <SQLConsole /> : null}
                     {!isOpen ? null : consoleLoading ? (
                         <Loader
