@@ -47,7 +47,17 @@ import {
     repairGeoSqlWithModel,
     sanitizeGeoSql
 } from "./queryGeoDataset/sql";
-import type { GeoReference, SpatialIntentResult } from "../spatialIntentRouter";
+import {
+    extractGeoQueryScope,
+    GeoQueryScope
+} from "./queryGeoDataset/scopeExtractor";
+import {
+    buildDeterministicTaskSpec,
+    formatTaskSpecForPlanner,
+    GeoQueryTaskSpec,
+    resolveGeoQueryTaskSpec
+} from "./queryGeoDataset/geoQueryTaskInterpreter";
+import type { GeoReference, SpatialIntentResult } from "../chatRouteRouter";
 
 type GeoSqlPlan =
     | {
@@ -100,6 +110,30 @@ function normalizeRefPointToken(sql: string): string {
         );
 }
 
+function sanitizeCandidatePlaceName(placeName?: string): string | undefined {
+    const value = (placeName || "").trim();
+    if (!value) {
+        return undefined;
+    }
+    const lowered = value.toLowerCase();
+    if (
+        [
+            "none",
+            "null",
+            "n/a",
+            "na",
+            "unknown",
+            "undefined",
+            "nil",
+            "-",
+            "--"
+        ].includes(lowered)
+    ) {
+        return undefined;
+    }
+    return value;
+}
+
 function hasRefPointToken(sql: string): boolean {
     return /(^|[^A-Za-z0-9_])__REF_POINT__(?=$|[^A-Za-z0-9_])/i.test(sql);
 }
@@ -112,6 +146,140 @@ function formatGeoReferenceForPlanner(reference: GeoReference | undefined) {
         return `internal key=${reference.key}, value=${reference.value}`;
     }
     return `external place=${reference.place}`;
+}
+
+function buildSpatialInstructionFromScope(scope: GeoQueryScope): string {
+    const detail = scope.spatialIntent;
+    if (detail.type === "none") {
+        return "No forced spatial operator family.";
+    }
+    const lines: string[] = ["[CRITICAL SPATIAL INSTRUCTION]"];
+    if (detail.type === "distance_buffer") {
+        const meters = detail.parameters?.distance_meters;
+        lines.push(
+            `- Use ST_DWithin(...) for buffer/distance filtering${
+                meters ? ` with distance=${meters} meters` : ""
+            }.`
+        );
+        lines.push(
+            "- Do NOT replace it with plain ST_Distance < x unless unavoidable."
+        );
+    } else if (detail.type === "nearest_neighbor") {
+        const limit = detail.parameters?.limit || 1;
+        lines.push(
+            "- Use KNN nearest-neighbor ordering: ORDER BY geom <-> target_geom."
+        );
+        lines.push(`- MUST include LIMIT ${limit}.`);
+    } else if (detail.type === "topological") {
+        lines.push(
+            "- Use topological predicates: ST_Intersects / ST_Contains / ST_Within as appropriate."
+        );
+    } else if (detail.type === "measurement") {
+        lines.push(
+            "- Use spatial measurement functions: ST_Area / ST_Length with correct units."
+        );
+    }
+
+    if (detail.anchor?.type === "internal_feature") {
+        lines.push(
+            `- Anchor "${detail.anchor.value}" is internal; use CTE/subquery from features, not external geocoding.`
+        );
+    } else if (detail.anchor?.type === "external_poi") {
+        lines.push(
+            `- Anchor "${detail.anchor.value}" is external; resolve as placeName and use __REF_POINT__.`
+        );
+    } else if (detail.anchor?.type === "implicit_bounds") {
+        lines.push(
+            "- Anchor is implicit viewport bounds; if bounds are provided, use envelope-based spatial filter."
+        );
+    }
+    return lines.join("\n");
+}
+
+function wantsCountContract(
+    scope: GeoQueryScope,
+    taskSpec?: GeoQueryTaskSpec
+): boolean {
+    return (
+        scope.intentType === "count" ||
+        (!!taskSpec && taskSpec.answerShape === "count")
+    );
+}
+
+function buildCountInstructionFromScope(
+    scope: GeoQueryScope,
+    taskSpec: GeoQueryTaskSpec
+): string {
+    if (!wantsCountContract(scope, taskSpec)) {
+        return "No forced count contract.";
+    }
+    return [
+        "[CRITICAL COUNT INSTRUCTION]",
+        "- The user asks for a COUNT-style answer (scope and/or interpreted task).",
+        "- SQL MUST return aggregated count (e.g. COUNT(*) AS total_count).",
+        "- Do NOT return row-level listing unless user explicitly asks for details."
+    ].join("\n");
+}
+
+function getSpatialContractViolation(
+    sql: string,
+    scope: GeoQueryScope
+): string | null {
+    const detail = scope.spatialIntent;
+    if (detail.type === "none") {
+        return null;
+    }
+    const query = sql || "";
+    if (detail.type === "distance_buffer") {
+        if (!/st_dwithin\s*\(/i.test(query)) {
+            return "distance_buffer query must use ST_DWithin(...)";
+        }
+        return null;
+    }
+    if (detail.type === "nearest_neighbor") {
+        if (!/order\s+by[\s\S]{0,200}<->/i.test(query)) {
+            return "nearest_neighbor query must use ORDER BY ... <-> ...";
+        }
+        if (!/\blimit\s+\d+\b/i.test(query)) {
+            return "nearest_neighbor query must include LIMIT";
+        }
+        const expectedLimit = detail.parameters?.limit;
+        if (expectedLimit) {
+            const match = query.match(/\blimit\s+(\d+)\b/i);
+            const actual = match?.[1] ? Number(match[1]) : undefined;
+            if (actual && actual !== expectedLimit) {
+                return `nearest_neighbor query LIMIT should be ${expectedLimit}`;
+            }
+        }
+        return null;
+    }
+    if (detail.type === "topological") {
+        if (!/st_(intersects|contains|within)\s*\(/i.test(query)) {
+            return "topological query must use ST_Intersects/ST_Contains/ST_Within";
+        }
+        return null;
+    }
+    if (detail.type === "measurement") {
+        if (!/st_(area|length)\s*\(/i.test(query)) {
+            return "measurement query must use ST_Area/ST_Length";
+        }
+        return null;
+    }
+    return null;
+}
+
+function getCountContractViolation(
+    sql: string,
+    scope: GeoQueryScope,
+    taskSpec?: GeoQueryTaskSpec
+): string | null {
+    if (!wantsCountContract(scope, taskSpec)) {
+        return null;
+    }
+    if (!/count\s*\(/i.test(sql || "")) {
+        return "count intent query must include COUNT(...) aggregation";
+    }
+    return null;
 }
 
 function getPlannerPropertyKeys(input: ChainInput): string[] {
@@ -167,41 +335,126 @@ export async function planGeoSqlQuery(
     fileDescItems?: string[]
 ): Promise<GeoSqlPlan> {
     const engine = await this.model.getEngine();
+    const schemaContextLabel =
+        "Dataset information (authoritative schema + sample values for SQL key/value grounding)";
     const distList = dists
         .map((item) => `${item.idx}: ${item.dist.title} (${item.dist.format})`)
         .join("\n");
-    const plannerSystemInstruction =
-        "You are a GeoSQL planner for Magda dataset chat. " +
-        "Output JSON only, no markdown, no explanation. " +
-        "If the question requires spatial/geographic SQL analysis, output: " +
-        '{"type":"query","distributionIndex":<integer>,"sqlQuery":"<PostGIS SQL>","placeName":"<optional>","countrycodes":"<optional>"} ' +
-        "The sqlQuery value MUST contain executable SQL only: start directly with SELECT or WITH; do not include apologies, explanations, markdown fences, comments, prose, JSON, or labels before/after the SQL. " +
-        "SQL must be a single SELECT/WITH query against the table `features` only. " +
-        "The browser PostGIS database always loads the selected spatial distribution into `features`; never use the dataset title, distribution title, filename, or a derived name such as Manningham_Street_Trees as a SQL table name. " +
-        "Only these top-level columns exist: id, properties, geom. Dataset attributes are JSONB keys under properties; use properties->>'key' or properties->'key'. " +
-        "Before writing SQL, inspect the provided schema/sample YAML and use only keys listed in schema_binding.properties_schema.existing_keys. " +
-        "When user asks semantic fields like name/address/category, map them to the closest existing property keys in metadata/sample (e.g. name -> asset_name) instead of inventing top-level columns. " +
-        "For result readability and map rendering, keep SELECT output compact: include id, requested computed metrics, a few readable properties from existing keys, and ST_AsText(geom) AS geom_wkt; do not SELECT *, raw geom, or full properties unless explicitly requested. " +
-        "If the user asks for features nearest to a point that is identified by a dataset column/key and value (e.g. id=12, street='King Street', species='Oak'), do NOT use placeName or __REF_POINT__; use a CTE/self-join against features to select the reference row. " +
-        "If Parser reference context says external place=<place>, preserve the user's requested spatial operation, set placeName to that exact place, and use __REF_POINT__ in sqlQuery where that external location is needed. " +
-        "__REF_POINT__ is a complete PostGIS geometry expression in SRID 4326; use it directly in ST_Distance/ST_DWithin/ST_Intersects. Never access __REF_POINT__.lon/__REF_POINT__.lat and never wrap it as ST_MakePoint(__REF_POINT__.lon, __REF_POINT__.lat). " +
-        "Only use placeName/__REF_POINT__ when the reference point is not expressed as an existing dataset column/key filter. " +
-        "If no suitable existing key is present, return a safe SQL query that exposes available keys/sample rows instead of guessing nonexistent columns. " +
-        "If the question does NOT require spatial SQL analysis, output: " +
-        '{"type":"not_applicable","reason":"<short reason>"}';
-    const parserReference = getParserReference(this);
-    const outputGuidance = buildGeoSqlOutputGuidance(
-        getPlannerPropertyKeys(this)
+    const plannerSystemInstruction = [
+        "## Role",
+        "You are a Magda GeoSQL Expert. Your sole task is to emit a JSON plan whose `sqlQuery` field contains valid PostGIS SQL against the table `features` (when type is `query`).",
+        "",
+        "## Database Schema (CRITICAL)",
+        "- Table name: `features` only. The browser runtime loads the chosen spatial distribution into this table; never use dataset title, distribution title, file names, or invented table names (e.g. no `Manningham_Street_Trees`).",
+        `- Source of truth for schema/keys/values: the \`${schemaContextLabel}\` block in the USER message. Assume \`features.properties\` follows that block's existing_keys and sample rows; do not invent keys outside it.`,
+        "- Columns:",
+        "  - `id`: unique row identifier.",
+        "  - `geom`: geometry in SRID 4326.",
+        "  - `properties`: JSONB holding all non-geometry attributes.",
+        "- Property access: `properties->>'key'` for text; `(properties->>'key')::numeric` / `::int` / `::boolean` for typed comparisons when appropriate; `properties->'key'` for nested JSON.",
+        "- NON-NEGOTIABLE: Except `id`, `geom`, and `properties`, DO NOT reference bare columns (e.g. `suburb`, `name`) in SELECT/WHERE/GROUP BY/ORDER BY. All business attributes MUST be accessed from `properties` JSONB.",
+        "",
+        "## PostGIS Function Catalog (Spatial Toolset)",
+        "Use only PostGIS patterns appropriate to the question. Common patterns:",
+        "1. **Proximity in degrees (planar geometry, small areas)**: `ST_DWithin(features.geom, <ref_geom>, <distance_degrees>)` — use small thresholds only when the user implies degree-based buffers.",
+        "2. **Proximity in meters (recommended for real distances)**: `ST_DWithin(features.geom::geography, <ref_geom>::geography, <meters>)` (or symmetric variants).",
+        "3. **Distance / ordering**: `ST_Distance(...)`, `ORDER BY geom <-> ref` for nearest-neighbour style queries when suitable.",
+        "4. **Literal point**: `ST_SetSRID(ST_MakePoint(lon, lat), 4326)` when the user gives explicit coordinates.",
+        "5. **Rendering / map preview**: always include `ST_AsText(geom) AS geom_wkt` in the final SELECT projection (alongside compact columns).",
+        "6. **Reference placeholder**: when Parser reference context indicates an external place, use the literal token `__REF_POINT__` in SQL as a ready-made geometry in SRID 4326. Use it directly inside spatial functions (e.g. `ST_DWithin`, `ST_Distance`, `ST_Intersects`). Do not wrap it in `ST_MakePoint`, do not read `.__REF_POINT__.lon` / `.lat`, and do not substitute prose.",
+        "",
+        "## Planning Rules",
+        '1. **No guessing keys**: If a JSONB key is not present in `schema_binding.properties_schema.existing_keys` (see YAML), do not invent it. If the user uses a vague label (e.g. "name"), map to the closest existing key using metadata/sample evidence.',
+        "2. **Self-join / CTE for in-dataset anchors**: When the reference is an existing feature identified by column/key + value (e.g. a street name, id, species), do **not** set `placeName` or rely on `__REF_POINT__`. Use a CTE, e.g. `WITH ref AS (SELECT geom FROM features WHERE properties->>'street' = 'King St' LIMIT 1) SELECT ... FROM features, ref WHERE ST_DWithin(features.geom, ref.geom, ...)` (adjust keys/values to real existing_keys).",
+        "3. **External place only**: If Parser reference context says external `place=<text>`, set `placeName` to that exact text and use `__REF_POINT__` in `sqlQuery` wherever that external location is needed.",
+        "4. **Single executable statement**: `sqlQuery` must be one `SELECT` or `WITH ... SELECT` only; no DDL/DML; no multiple statements; no markdown, apologies, comments outside SQL, or JSON around the SQL.",
+        "5. **Compact SELECT**: Prefer `id`, a few `properties->>'...'` columns needed to answer the question, computed metrics, and `ST_AsText(geom) AS geom_wkt`. Avoid `SELECT *`, raw `geom` binary, or entire `properties` unless the user explicitly asks.",
+        "6. **If no spatial SQL is needed** (pure metadata chat, greetings, non-geo filters only): return `not_applicable` (see Output Format).",
+        "",
+        "## Output Format",
+        "Return **ONLY** raw JSON. No markdown fences, no prose before or after the JSON.",
+        "If spatial analysis applies:",
+        '{"type":"query","distributionIndex":<integer>,"sqlQuery":"<single SELECT or WITH...SELECT>","placeName":"<optional string>","countrycodes":"<optional ISO country code for geocoder, e.g. au>"}',
+        "If spatial analysis does not apply:",
+        '{"type":"not_applicable","reason":"<short reason>"}'
+    ].join("\n");
+    const plannerPropertyKeys = getPlannerPropertyKeys(this);
+    if (plannerPropertyKeys.length) {
+        pushGeoRunLog(
+            this,
+            `Sample attribute keys in properties (JSON) injected into planner context: ${plannerPropertyKeys.join(
+                ", "
+            )}`
+        );
+    }
+    const scope = extractGeoQueryScope({
+        question: this.question,
+        propertyKeys: plannerPropertyKeys,
+        valueSamplesByKey: collectValueSamplesByKey(
+            this.keyContextData?.datasetProfile
+        ),
+        datasetScopeTerms: buildCoverageTerms(
+            this.keyContextData?.datasetProfile
+        )
+    });
+    const taskSpec = await resolveGeoQueryTaskSpec({
+        question: this.question,
+        scope,
+        propertyKeys: plannerPropertyKeys,
+        getEngine: () => this.model.getEngine()
+    });
+    (this as ChainInput & {
+        __geoQueryTaskSpec?: GeoQueryTaskSpec;
+    }).__geoQueryTaskSpec = taskSpec;
+    pushGeoRunLog(
+        this,
+        `Interpreted executable query problem (${
+            taskSpec.source
+        }):\n${formatTaskSpecForPlanner(taskSpec)}`
     );
+    const coverageAndReference = resolveGeoReferenceForQuery(
+        this,
+        plannerPropertyKeys
+    );
+    const outputGuidance = buildGeoSqlOutputGuidance(plannerPropertyKeys);
     const plannerUserPrompt =
         `User question:\n${this.question}\n\n` +
-        `Parser reference context:\n${formatGeoReferenceForPlanner(
-            parserReference
+        `${formatTaskSpecForPlanner(taskSpec)}\n\n` +
+        `Spatial coverage mentions from question (dataset scope terms):\n${
+            coverageAndReference.coverageMentions.length
+                ? coverageAndReference.coverageMentions.join(", ")
+                : "none"
+        }\n\n` +
+        `Reference point context (queryGeoDataset inferred):\n${formatGeoReferenceForPlanner(
+            coverageAndReference.reference
         )}\n\n` +
+        `Reference source:\n${coverageAndReference.source}\n\n` +
+        `Bound filters inferred from question (authoritative unless contradicted by schema):\n${
+            scope.boundFilters.length
+                ? scope.boundFilters
+                      .map(
+                          (item) =>
+                              `${item.key}=${item.value} (source=${
+                                  item.source
+                              }, confidence=${item.confidence.toFixed(2)})`
+                      )
+                      .join("; ")
+                : "none"
+        }\n\n` +
+        `External reference policy:\n${
+            scope.needsExternalReference
+                ? `External place candidate=${scope.externalPlace || "n/a"}`
+                : "No external reference needed; prefer attribute filters over geocoding."
+        }\n\n` +
+        `Spatial intent detail:\n${JSON.stringify(scope.spatialIntent)}\n\n` +
+        `${buildSpatialInstructionFromScope(scope)}\n\n` +
+        `${buildCountInstructionFromScope(scope, taskSpec)}\n\n` +
         `SQL output guidance:\n${outputGuidance}\n\n` +
         `Available spatial distributions:\n${distList}\n\n` +
-        `Metadata brief:\n${metadataBrief || "N/A"}\n\n` +
-        `Schema/sample YAML for GeoSQL generation:\n${
+        `Dataset information (high-level metadata; use this as dataset context):\n${
+            metadataBrief || "N/A"
+        }\n\n` +
+        `${schemaContextLabel}:\n${
             fileDescItems?.length ? fileDescItems.join("\n---\n") : "N/A"
         }`;
     const reply = await engine.chat.completions.create({
@@ -459,6 +712,239 @@ function getParserReference(input: ChainInput): GeoReference | undefined {
         .__geoIntent?.reference;
 }
 
+function buildCoverageTerms(datasetProfile?: DatasetProfile): string[] {
+    if (!datasetProfile) {
+        return [];
+    }
+    const raw = [
+        datasetProfile.datasetTitle || "",
+        datasetProfile.datasetDescription || "",
+        ...(datasetProfile.datasetTags || []),
+        ...(datasetProfile.datasetThemes || [])
+    ]
+        .join(" ")
+        .toLowerCase();
+    if (!raw.trim()) {
+        return [];
+    }
+    const terms = raw
+        .split(/[^a-z0-9\u4e00-\u9fff]+/g)
+        .map((item) => item.trim())
+        .filter((item) => item.length >= 2);
+    return [...new Set(terms)];
+}
+
+function detectCoverageMentions(
+    question: string,
+    datasetProfile?: DatasetProfile
+): string[] {
+    const q = normalizeFreeText(question);
+    if (!q) {
+        return [];
+    }
+    const terms = buildCoverageTerms(datasetProfile);
+    if (!terms.length) {
+        return [];
+    }
+    return terms.filter((term) => q.includes(term)).slice(0, 12);
+}
+
+function collectValueSamplesByKey(
+    datasetProfile?: DatasetProfile
+): Record<
+    string,
+    {
+        mode: "full" | "partial";
+        values: string[];
+        approxDistinct?: number;
+    }
+> {
+    const result: Record<
+        string,
+        {
+            mode: "full" | "partial";
+            values: string[];
+            approxDistinct?: number;
+        }
+    > = {};
+    datasetProfile?.spatial?.items?.forEach((item) => {
+        Object.entries(item.valueSamples || {}).forEach(([key, profile]) => {
+            if (!profile?.values?.length) {
+                return;
+            }
+            if (
+                !result[key] ||
+                (result[key].mode === "partial" && profile.mode === "full")
+            ) {
+                result[key] = {
+                    mode: profile.mode,
+                    values: profile.values,
+                    approxDistinct: profile.approxDistinct
+                };
+            }
+        });
+    });
+    return result;
+}
+
+function collectProfileAttributeValues(
+    datasetProfile?: DatasetProfile
+): {
+    enumValues: Set<string>;
+    sampleRowValues: Set<string>;
+} {
+    const enumValues = new Set<string>();
+    const sampleRowValues = new Set<string>();
+    datasetProfile?.spatial?.items?.forEach((item) => {
+        Object.values(item.valueSamples || {}).forEach((valueProfile) => {
+            (valueProfile?.values || []).forEach((value) => {
+                const norm = normalizeFreeText(String(value));
+                if (norm.length >= 2 && norm.length <= 120) {
+                    enumValues.add(norm);
+                }
+            });
+        });
+        (item.sampleRows || []).forEach((row) => {
+            Object.values(row || {}).forEach((value) => {
+                if (value === null || typeof value === "undefined") {
+                    return;
+                }
+                const norm = normalizeFreeText(String(value));
+                if (norm.length >= 2 && norm.length <= 120) {
+                    sampleRowValues.add(norm);
+                }
+            });
+        });
+    });
+    return { enumValues, sampleRowValues };
+}
+
+function isLikelyAttributeValueReference(
+    candidate: string,
+    profileValues: ReturnType<typeof collectProfileAttributeValues>
+): boolean {
+    const place = normalizeFreeText(candidate);
+    const enumValues = profileValues.enumValues;
+    const sampleRowValues = profileValues.sampleRowValues;
+    if (
+        !place ||
+        place.length < 2 ||
+        (!enumValues.size && !sampleRowValues.size)
+    ) {
+        return false;
+    }
+    // Highest priority: sampled enum/top values from valueSamples.
+    if (enumValues.has(place)) {
+        return true;
+    }
+    for (const sample of enumValues) {
+        if (sample.length < 3) {
+            continue;
+        }
+        if (
+            place === sample ||
+            place.includes(sample) ||
+            sample.includes(place)
+        ) {
+            return true;
+        }
+    }
+    // Fallback: sample rows may be noisy/partial, so only exact match.
+    if (sampleRowValues.has(place)) {
+        return true;
+    }
+    return false;
+}
+
+function extractInternalReferenceFromQuestion(
+    question: string,
+    propKeys?: string[] | null
+): GeoReference | null {
+    for (const key of propKeys || []) {
+        const value = inferValueForPropertyKey(question, key);
+        if (value) {
+            return {
+                type: "internal",
+                key,
+                value
+            };
+        }
+    }
+    return null;
+}
+
+function resolveGeoReferenceForQuery(
+    input: ChainInput,
+    propKeys?: string[] | null
+): { reference: GeoReference; source: string; coverageMentions: string[] } {
+    const datasetProfile = input.keyContextData?.datasetProfile;
+    const parserReference = getParserReference(input);
+    const coverageMentions = detectCoverageMentions(
+        input.question,
+        datasetProfile
+    );
+    const anchorCue = hasExplicitReferenceAnchorCue(input.question);
+    const profileValues = collectProfileAttributeValues(datasetProfile);
+
+    const internalFromQuestion = extractInternalReferenceFromQuestion(
+        input.question,
+        propKeys
+    );
+    if (internalFromQuestion) {
+        return {
+            reference: internalFromQuestion,
+            source: "question_internal",
+            coverageMentions
+        };
+    }
+
+    const inferredPlace = inferPlaceNameFromQuestion(input.question);
+    if (
+        inferredPlace &&
+        anchorCue &&
+        !isLikelyDatasetScopePlace(inferredPlace, datasetProfile) &&
+        !isLikelyAttributeValueReference(inferredPlace, profileValues)
+    ) {
+        return {
+            reference: { type: "external", place: inferredPlace },
+            source: "question_external",
+            coverageMentions
+        };
+    }
+
+    if (parserReference?.type === "internal") {
+        const validKey = (propKeys || []).includes(parserReference.key);
+        if (validKey && parserReference.value.trim()) {
+            return {
+                reference: parserReference,
+                source: "parser_internal",
+                coverageMentions
+            };
+        }
+    }
+    if (parserReference?.type === "external") {
+        const parserPlace = parserReference.place.trim();
+        if (
+            parserPlace &&
+            anchorCue &&
+            !isLikelyDatasetScopePlace(parserPlace, datasetProfile) &&
+            !isLikelyAttributeValueReference(parserPlace, profileValues)
+        ) {
+            return {
+                reference: { type: "external", place: parserPlace },
+                source: "parser_external",
+                coverageMentions
+            };
+        }
+    }
+
+    return {
+        reference: { type: "none" },
+        source: "none",
+        coverageMentions
+    };
+}
+
 function buildReferenceOutputColumns(propKeys?: string[] | null): string {
     const selected = chooseCoreDisplayKeys(propKeys, 4);
     return selected.length
@@ -696,9 +1182,27 @@ export async function queryGeoSpatialWithSQLQuery(
             ? propKeysFromProfile
             : await sampleGeoPropertyKeys(pgExec);
 
-    const parserReference = getParserReference(this);
+    const coverageAndReference = resolveGeoReferenceForQuery(this, propKeys);
+    const profileValues = collectProfileAttributeValues(
+        this.keyContextData?.datasetProfile
+    );
+    const scope = extractGeoQueryScope({
+        question: this.question,
+        propertyKeys: propKeys || [],
+        valueSamplesByKey: collectValueSamplesByKey(
+            this.keyContextData?.datasetProfile
+        ),
+        datasetScopeTerms: buildCoverageTerms(
+            this.keyContextData?.datasetProfile
+        )
+    });
+    const taskSpecForContract =
+        (this as ChainInput & { __geoQueryTaskSpec?: GeoQueryTaskSpec })
+            .__geoQueryTaskSpec ??
+        buildDeterministicTaskSpec(scope, this.question, propKeys || []);
+    const parserReference = coverageAndReference.reference;
     const parserPlaceName =
-        parserReference?.type === "external" && parserReference.place.trim()
+        parserReference.type === "external" && parserReference.place.trim()
             ? parserReference.place.trim()
             : undefined;
     const shouldIgnoreParserExternalPlace =
@@ -714,6 +1218,52 @@ export async function queryGeoSpatialWithSQLQuery(
             `Parser external reference "${parserPlaceName}" looks like dataset coverage context without explicit anchor intent; treating as non-reference.`
         );
     }
+    if (coverageAndReference.coverageMentions.length) {
+        pushGeoRunLog(
+            this,
+            `Detected dataset scope mentions: ${coverageAndReference.coverageMentions.join(
+                ", "
+            )}.`
+        );
+    }
+    if (scope.boundFilters.length) {
+        pushGeoRunLog(
+            this,
+            `Scope extractor bound filters: ${scope.boundFilters
+                .map((item) => `${item.key}=${item.value}`)
+                .join(", ")}.`
+        );
+    }
+    if (
+        parserPlaceName &&
+        isLikelyAttributeValueReference(parserPlaceName, profileValues)
+    ) {
+        pushGeoRunLog(
+            this,
+            `Parser place "${parserPlaceName}" matches sample attribute values; treating it as attribute context instead of external reference point.`
+        );
+    }
+    const plannerPlaceName = sanitizeCandidatePlaceName(placeName);
+    const shouldIgnorePlannerPlaceName =
+        !!plannerPlaceName &&
+        ((isLikelyDatasetScopePlace(
+            plannerPlaceName,
+            this.keyContextData?.datasetProfile
+        ) &&
+            !hasExplicitReferenceAnchorCue(this.question)) ||
+            isLikelyAttributeValueReference(plannerPlaceName, profileValues));
+    if (shouldIgnorePlannerPlaceName && plannerPlaceName) {
+        pushGeoRunLog(
+            this,
+            `Planner place "${plannerPlaceName}" looks like dataset scope/attribute value; ignoring external geocode reference.`
+        );
+    }
+    pushGeoRunLog(
+        this,
+        `Reference resolution source: ${
+            coverageAndReference.source
+        }; value: ${formatGeoReferenceForPlanner(parserReference)}.`
+    );
     if (parserPlaceName) {
         pushGeoRunLog(
             this,
@@ -732,12 +1282,27 @@ export async function queryGeoSpatialWithSQLQuery(
         formatGeoSqlLog("Planner generated GeoSQL", finalSqlQuery)
     );
     const proximityIntent = hasProximityIntent(this.question);
+    const scopeReferenceFeatureFilter: ReferenceFeatureFilter | null =
+        scope.boundFilters.length && proximityIntent
+            ? {
+                  label: `properties->>'${
+                      scope.boundFilters[0].key
+                  }' = ${quoteSqlLiteral(scope.boundFilters[0].value)}`,
+                  whereSql: `properties->>'${
+                      scope.boundFilters[0].key
+                  }' = ${quoteSqlLiteral(scope.boundFilters[0].value)}`,
+                  excludeSql: `COALESCE(f.properties->>'${
+                      scope.boundFilters[0].key
+                  }', '') <> ${quoteSqlLiteral(scope.boundFilters[0].value)}`
+              }
+            : null;
     const parserReferenceFeatureFilter = buildReferenceFeatureFilterFromParser(
         parserReference,
         propKeys
     );
     const referenceFeatureFilter =
         parserReferenceFeatureFilter ||
+        scopeReferenceFeatureFilter ||
         inferReferenceFeatureFilterFromQuestion(this.question, propKeys);
     if (proximityIntent && referenceFeatureFilter) {
         if (
@@ -773,11 +1338,12 @@ export async function queryGeoSpatialWithSQLQuery(
         ? undefined
         : parserPlaceName && !shouldIgnoreParserExternalPlace
         ? parserPlaceName
-        : placeName && placeName.trim()
-        ? placeName.trim()
-        : proximityIntent
+        : plannerPlaceName && !shouldIgnorePlannerPlaceName
+        ? plannerPlaceName
+        : proximityIntent && scope.needsExternalReference
         ? inferPlaceNameFromQuestion(this.question) || undefined
         : undefined;
+    effectivePlaceName = sanitizeCandidatePlaceName(effectivePlaceName);
     if (!parserPlaceName && !placeName && effectivePlaceName) {
         pushGeoRunLog(
             this,
@@ -850,6 +1416,92 @@ export async function queryGeoSpatialWithSQLQuery(
         );
     }
 
+    let spatialContractViolation = getSpatialContractViolation(
+        finalSqlQuery,
+        scope
+    );
+    if (spatialContractViolation) {
+        pushGeoRunLog(
+            this,
+            `Spatial contract violation before execution: ${spatialContractViolation}. Attempting contract-aware rewrite.`
+        );
+        const contractRepaired = await repairGeoSqlWithModel(
+            this,
+            finalSqlQuery,
+            `${buildSpatialInstructionFromScope(
+                scope
+            )}\n\n[NON-NEGOTIABLE]\n- Rewrite SQL to satisfy the required spatial operator family and parameters.\n- Keep all existing bound attribute filters.\n- Return SQL only.`,
+            propKeys,
+            metadataBrief,
+            schemaContext
+        );
+        if (contractRepaired) {
+            finalSqlQuery = normalizeRefPointToken(contractRepaired);
+            pushGeoRunLog(
+                this,
+                formatGeoSqlLog(
+                    "GeoSQL after spatial-contract rewrite",
+                    finalSqlQuery
+                )
+            );
+            spatialContractViolation = getSpatialContractViolation(
+                finalSqlQuery,
+                scope
+            );
+        }
+    }
+    if (spatialContractViolation) {
+        pushGeoUserMessage(
+            this,
+            `Unable to build SQL that satisfies required spatial intent: ${spatialContractViolation}. Please rephrase with explicit distance/nearest/intersection wording.`
+        );
+        return null;
+    }
+    let countContractViolation = getCountContractViolation(
+        finalSqlQuery,
+        scope,
+        taskSpecForContract
+    );
+    if (countContractViolation) {
+        pushGeoRunLog(
+            this,
+            `Count contract violation before execution: ${countContractViolation}. Attempting count-aware rewrite.`
+        );
+        const countRepaired = await repairGeoSqlWithModel(
+            this,
+            finalSqlQuery,
+            `${buildCountInstructionFromScope(
+                scope,
+                taskSpecForContract
+            )}\n\n[NON-NEGOTIABLE]\n- Rewrite SQL into a COUNT aggregation answer.\n- Keep all existing bound filters.\n- Return SQL only.`,
+            propKeys,
+            metadataBrief,
+            schemaContext
+        );
+        if (countRepaired) {
+            finalSqlQuery = normalizeRefPointToken(countRepaired);
+            pushGeoRunLog(
+                this,
+                formatGeoSqlLog(
+                    "GeoSQL after count-contract rewrite",
+                    finalSqlQuery
+                )
+            );
+            countContractViolation = getCountContractViolation(
+                finalSqlQuery,
+                scope,
+                taskSpecForContract
+            );
+        }
+    }
+    if (countContractViolation) {
+        pushGeoUserMessage(
+            this,
+            `Unable to build SQL that satisfies count intent: ${countContractViolation}. Please rephrase your counting condition.`
+        );
+        return null;
+    }
+
     const sanitized = sanitizeGeoSql(finalSqlQuery, propKeys);
     finalSqlQuery = sanitized.query;
     (this as any).__geoEvalSanitizerFixes = sanitized.fixes;
@@ -879,13 +1531,6 @@ export async function queryGeoSpatialWithSQLQuery(
             return null;
         }
     }
-    if (propKeys?.length) {
-        pushGeoRunLog(
-            this,
-            `Sample attribute keys in properties (JSON): ${propKeys.join(", ")}`
-        );
-    }
-
     let records: Record<string, any>[] | null = null;
     let sqlToRun = finalSqlQuery;
     const maxAttempts = 2;
@@ -1146,12 +1791,24 @@ export async function createQueryGeoDatasetTool(
         (this as ChainInput & {
             __geoFileDescItems?: string[];
         }).__geoFileDescItems = prepared.fileDescItems;
-        const generatedIntro = await generateGeoDatasetIntro(
-            this,
-            prepared.introContext
-        );
-        if (generatedIntro) {
-            pushGeoUserMessage(this, generatedIntro);
+        const introKey =
+            this.keyContextData?.datasetProfileVersionKey ||
+            dataset?.identifier ||
+            "__default__";
+        const introShownKey = (this as ChainInput & {
+            __geoIntroShownKey?: string;
+        }).__geoIntroShownKey;
+        if (introShownKey !== introKey) {
+            const generatedIntro = await generateGeoDatasetIntro(
+                this,
+                prepared.introContext
+            );
+            if (generatedIntro) {
+                pushGeoUserMessage(this, generatedIntro);
+                (this as ChainInput & {
+                    __geoIntroShownKey?: string;
+                }).__geoIntroShownKey = introKey;
+            }
         }
         try {
             const plan = await planGeoSqlQuery.call(

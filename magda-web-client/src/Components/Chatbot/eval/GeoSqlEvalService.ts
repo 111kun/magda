@@ -3,7 +3,7 @@ import {
     classifySpatialIntent,
     GeoReference,
     SpatialIntentResult
-} from "../spatialIntentRouter";
+} from "../chatRouteRouter";
 import { sanitizeGeoSql } from "../tools/queryGeoDataset/sql";
 import { ParsedDistribution } from "helpers/record";
 

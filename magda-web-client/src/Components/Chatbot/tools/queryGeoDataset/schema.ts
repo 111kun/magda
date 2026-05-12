@@ -41,6 +41,10 @@ export type PropertySchemaBinding =
               inferred_type: SampledPropertyField["inferredType"];
               sample_value: string;
               recommended_accessor: string;
+              enum_values?: string[];
+              sample_values?: string[];
+              approx_distinct?: number;
+              enum_note?: string;
           }[];
       }
     | { status: "empty" | "sampling_failed"; message: string };

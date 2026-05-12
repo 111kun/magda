@@ -12,6 +12,103 @@ const LEAFLET_DEFAULT_ICON_IMAGE_PATH =
 
 /** Stroke / ring colour for query-result style (hollow red circles, red outlines). */
 const RESULT_LINE_COLOR = "#c62828";
+const RESULT_LINE_COLOR_HI = "#b71c1c";
+
+const POINT_STYLE_DEFAULT: L.PathOptions = {
+    radius: 6,
+    color: RESULT_LINE_COLOR,
+    weight: 2,
+    fillColor: "#ffffff",
+    fillOpacity: 0.15,
+    opacity: 1
+};
+
+const POINT_STYLE_HIGHLIGHT: L.PathOptions = {
+    radius: 9,
+    color: RESULT_LINE_COLOR_HI,
+    weight: 3,
+    fillColor: "#ffcdd2",
+    fillOpacity: 0.55,
+    opacity: 1
+};
+
+const LINE_STYLE_DEFAULT: L.PathOptions = {
+    color: RESULT_LINE_COLOR,
+    weight: 2,
+    opacity: 1,
+    fillOpacity: 0
+};
+
+const LINE_STYLE_HIGHLIGHT: L.PathOptions = {
+    color: RESULT_LINE_COLOR_HI,
+    weight: 4,
+    opacity: 1,
+    fillOpacity: 0
+};
+
+const POLYGON_STYLE_DEFAULT: L.PathOptions = {
+    color: RESULT_LINE_COLOR,
+    weight: 2,
+    opacity: 1,
+    fillColor: "#ffcdd2",
+    fillOpacity: 0.22
+};
+
+const POLYGON_STYLE_HIGHLIGHT: L.PathOptions = {
+    color: RESULT_LINE_COLOR_HI,
+    weight: 3,
+    opacity: 1,
+    fillColor: "#ffab91",
+    fillOpacity: 0.45
+};
+
+function getHoverStylePair(
+    feature: any
+): { defaultStyle: L.PathOptions; highlightStyle: L.PathOptions } {
+    const t = feature?.geometry?.type as string | undefined;
+    if (t === "Point" || t === "MultiPoint") {
+        return {
+            defaultStyle: { ...POINT_STYLE_DEFAULT },
+            highlightStyle: { ...POINT_STYLE_HIGHLIGHT }
+        };
+    }
+    if (t === "LineString" || t === "MultiLineString") {
+        return {
+            defaultStyle: { ...LINE_STYLE_DEFAULT },
+            highlightStyle: { ...LINE_STYLE_HIGHLIGHT }
+        };
+    }
+    return {
+        defaultStyle: { ...POLYGON_STYLE_DEFAULT },
+        highlightStyle: { ...POLYGON_STYLE_HIGHLIGHT }
+    };
+}
+
+function bindPathHoverHighlight(
+    layer: L.Layer,
+    defaultStyle: L.PathOptions,
+    highlightStyle: L.PathOptions
+): void {
+    const bindOne = (ly: L.Layer) => {
+        const path = ly as L.Path;
+        if (typeof path.setStyle !== "function") {
+            return;
+        }
+        path.on("mouseover", () => {
+            path.setStyle({ ...highlightStyle });
+        });
+        path.on("mouseout", () => {
+            path.setStyle({ ...defaultStyle });
+        });
+    };
+
+    const group = layer as L.LayerGroup;
+    if (group && typeof group.eachLayer === "function") {
+        group.eachLayer(bindOne);
+    } else {
+        bindOne(layer);
+    }
+}
 
 function escapeHtml(text: string): string {
     return text
@@ -82,22 +179,18 @@ function geoJsonLayerOptions(): {
 } {
     return {
         pointToLayer: (_feature, latlng) =>
-            L.circleMarker(latlng, {
-                radius: 6,
-                color: RESULT_LINE_COLOR,
-                weight: 2,
-                fillColor: "#ffffff",
-                fillOpacity: 0.15,
-                opacity: 1
-            }),
-        style: () => ({
-            color: RESULT_LINE_COLOR,
-            weight: 2,
-            opacity: 1,
-            fillColor: "#ffcdd2",
-            fillOpacity: 0.22
-        }),
+            L.circleMarker(latlng, { ...POINT_STYLE_DEFAULT }),
+        style(feature) {
+            const t = feature?.geometry?.type as string | undefined;
+            if (t === "LineString" || t === "MultiLineString") {
+                return { ...LINE_STYLE_DEFAULT };
+            }
+            return { ...POLYGON_STYLE_DEFAULT };
+        },
         onEachFeature(feature, layer) {
+            const { defaultStyle, highlightStyle } = getHoverStylePair(feature);
+            bindPathHoverHighlight(layer, defaultStyle, highlightStyle);
+
             const html = formatFeaturePropertiesPopupHtml(feature);
             const withPopup = layer as L.Layer & {
                 bindPopup: (c: string, o?: object) => void;

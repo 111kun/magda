@@ -191,6 +191,7 @@ async function buildGeoFileProfilesFromSpatialProfile(
             .map((item) => normalizeGeomFamily(item.type))
             .filter((value, index, array) => array.indexOf(value) === index);
         const keys = profile?.propertyKeys || [];
+        const valueSamples = profile?.valueSamples || {};
         const propertiesSchema: PropertySchemaBinding = keys.length
             ? {
                   status: "ok",
@@ -199,7 +200,22 @@ async function buildGeoFileProfilesFromSpatialProfile(
                       key,
                       inferred_type: "mixed",
                       sample_value: "",
-                      recommended_accessor: `properties->>'${key}'`
+                      recommended_accessor: `properties->>'${key}'`,
+                      ...(valueSamples[key]
+                          ? valueSamples[key].mode === "full"
+                              ? {
+                                    enum_values: valueSamples[key].values,
+                                    enum_note:
+                                        "Low-cardinality field; full enum values sampled from dataset profile."
+                                }
+                              : {
+                                    sample_values: valueSamples[key].values,
+                                    approx_distinct:
+                                        valueSamples[key].approxDistinct,
+                                    enum_note:
+                                        "High-cardinality field; representative top values sampled from dataset profile."
+                                }
+                          : {})
                   }))
               }
             : {

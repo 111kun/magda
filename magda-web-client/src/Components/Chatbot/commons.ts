@@ -10,6 +10,12 @@ export type GeometryTypeCount = {
     count: number;
 };
 
+export type ValueSampleProfile = {
+    mode: "full" | "partial";
+    values: string[];
+    approxDistinct: number;
+};
+
 export interface TabularProfileItem {
     distributionIndex: number;
     title: string;
@@ -29,6 +35,8 @@ export interface SpatialProfileItem {
     propertyKeys?: string[];
     sampledFeatureCount?: number;
     sampleRows?: Record<string, any>[];
+    /** Per-property value samples for enum-like grounding in prompts. */
+    valueSamples?: Record<string, ValueSampleProfile>;
     bbox?: [number, number, number, number];
     bboxWkt?: string;
     error?: string;
@@ -73,6 +81,14 @@ export interface KeyContextData {
     datasetProfileVersionKey?: string;
 }
 
+/** Optional dataset-scope hint for routing (see chatRouteRouter). */
+export type SpatialCoverageHint = {
+    /** Normalised tokens from title, description, tags, themes. */
+    scopeTokens: string[];
+    /** Short paragraph injected into the spatial classifier prompt. */
+    scopeHintForLlm: string;
+};
+
 export interface ChainInput {
     appName: string;
     question: string;
@@ -83,6 +99,8 @@ export interface ChainInput {
     dataset: ParsedDataset | undefined;
     distribution: ParsedDistribution | undefined;
     keyContextData: KeyContextData;
+    /** Set by AgentChain before spatial routing when a dataset profile is available. */
+    spatialCoverage?: SpatialCoverageHint;
 }
 
 export function getLocationType(location: Location): LocationType {

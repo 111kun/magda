@@ -2,7 +2,8 @@ import {
     ChainInput,
     DatasetProfile,
     SpatialProfileItem,
-    TabularProfileItem
+    TabularProfileItem,
+    ValueSampleProfile
 } from "./commons";
 import { ParsedDistribution } from "helpers/record";
 import {
@@ -59,6 +60,74 @@ function makeSpatialItems(dists: ParsedDistribution[]): SpatialProfileItem[] {
             title: item.dist.title,
             format: item.dist.format
         }));
+}
+
+function quoteSqlLiteral(value: string): string {
+    return `'${value.replace(/'/g, "''")}'`;
+}
+
+async function sampleValueProfilesForKeys(
+    propertyKeys: string[]
+): Promise<Record<string, ValueSampleProfile>> {
+    const result: Record<string, ValueSampleProfile> = {};
+    const candidateKeys = propertyKeys.slice(0, 24);
+    for (const key of candidateKeys) {
+        const keyLiteral = quoteSqlLiteral(key);
+        const distinctRows = await runPostgisQuery(
+            `SELECT COUNT(DISTINCT properties->>${keyLiteral})::int AS distinct_cnt
+             FROM features
+             WHERE properties ? ${keyLiteral}
+               AND jsonb_typeof(properties->${keyLiteral}) = 'string'
+               AND COALESCE(properties->>${keyLiteral}, '') <> ''`
+        );
+        const distinctCnt = Number(distinctRows?.[0]?.distinct_cnt || 0);
+        if (!distinctCnt || distinctCnt <= 1) {
+            continue;
+        }
+        if (distinctCnt <= 50) {
+            const valuesRows = await runPostgisQuery(
+                `SELECT DISTINCT properties->>${keyLiteral} AS value
+                 FROM features
+                 WHERE properties ? ${keyLiteral}
+                   AND jsonb_typeof(properties->${keyLiteral}) = 'string'
+                   AND COALESCE(properties->>${keyLiteral}, '') <> ''
+                 ORDER BY 1
+                 LIMIT 50`
+            );
+            const values = (valuesRows || [])
+                .map((row) => String(row?.value || "").trim())
+                .filter((v) => !!v);
+            if (values.length) {
+                result[key] = {
+                    mode: "full",
+                    values,
+                    approxDistinct: distinctCnt
+                };
+            }
+            continue;
+        }
+        const topRows = await runPostgisQuery(
+            `SELECT properties->>${keyLiteral} AS value, COUNT(*)::int AS cnt
+             FROM features
+             WHERE properties ? ${keyLiteral}
+               AND jsonb_typeof(properties->${keyLiteral}) = 'string'
+               AND COALESCE(properties->>${keyLiteral}, '') <> ''
+             GROUP BY 1
+             ORDER BY cnt DESC
+             LIMIT 12`
+        );
+        const values = (topRows || [])
+            .map((row) => String(row?.value || "").trim())
+            .filter((v) => !!v);
+        if (values.length) {
+            result[key] = {
+                mode: "partial",
+                values,
+                approxDistinct: distinctCnt
+            };
+        }
+    }
+    return result;
 }
 
 export function buildDatasetProfileBase(input: ChainInput): DatasetProfile {
@@ -128,16 +197,28 @@ export async function enrichSpatialProfile(
                  WHERE properties IS NOT NULL
                  LIMIT 60`
             );
+            const sampleRows = await runPostgisQuery(
+                `SELECT properties
+                 FROM features
+                 WHERE properties IS NOT NULL
+                 LIMIT 8`
+            );
+            const propertyKeys = (keyRows || [])
+                .map((row) => String(row.key || "").trim())
+                .filter((key) => !!key);
+            const valueSamples = await sampleValueProfilesForKeys(propertyKeys);
             items.push({
                 ...item,
                 geometryTypes: (geomTypesRows || []).map((row) => ({
                     type: String(row.geom_type || ""),
                     count: Number(row.cnt || 0)
                 })),
-                propertyKeys: (keyRows || [])
-                    .map((row) => String(row.key || "").trim())
-                    .filter((key) => !!key),
-                sampledFeatureCount: 500
+                propertyKeys,
+                sampledFeatureCount: 500,
+                sampleRows: (sampleRows || [])
+                    .map((row) => row?.properties)
+                    .filter((row) => !!row && typeof row === "object"),
+                valueSamples
             });
         } catch {
             items.push({

@@ -39,6 +39,8 @@ interface MessageItem {
     content: string;
     // For some implementation, messages that are marked as optional will not be passed to LLM as part of history
     optional?: boolean;
+    title?: string;
+    turnId?: number;
 }
 
 interface StreamStateType {
@@ -120,6 +122,7 @@ const ChatBoxMessagePanel: FunctionComponent<PropsType> = (props) => {
     );
 
     const messageQueueRef = useRef<MessageItem[]>(getEmptyMessageQueue());
+    const currentTurnIdRef = useRef<number>(0);
     const messageQueueLen = messageQueueRef.current?.length
         ? messageQueueRef.current.length
         : 0;
@@ -171,7 +174,8 @@ const ChatBoxMessagePanel: FunctionComponent<PropsType> = (props) => {
                     // push the partial message to the completed message queue
                     addMessage(messageQueueRef, {
                         type: "bot",
-                        content: partialMessage
+                        content: partialMessage,
+                        turnId: currentTurnIdRef.current
                     });
                 }
                 streamStateRef.current.streamId = streamId ? streamId : null;
@@ -192,6 +196,7 @@ const ChatBoxMessagePanel: FunctionComponent<PropsType> = (props) => {
 
             if (eventMessage.event === EVENT_TYPE_CLIENT_RESET_MESSAGE_QUEUE) {
                 messageQueueRef.current = getEmptyMessageQueue();
+                currentTurnIdRef.current = 0;
                 setDataReloadToken(Math.random().toString());
                 return;
             }
@@ -208,7 +213,12 @@ const ChatBoxMessagePanel: FunctionComponent<PropsType> = (props) => {
                 if (!eventMessage?.data) {
                     throw new Error("Invalid EVENT_TYPE_CLIENT_MESSAGE_SENT");
                 }
-                addMessage(messageQueueRef, eventMessage.data as MessageItem);
+                currentTurnIdRef.current += 1;
+                const userMessage = {
+                    ...(eventMessage.data as MessageItem),
+                    turnId: currentTurnIdRef.current
+                };
+                addMessage(messageQueueRef, userMessage);
                 setDataReloadToken(Math.random().toString());
                 return;
             }
@@ -234,6 +244,7 @@ const ChatBoxMessagePanel: FunctionComponent<PropsType> = (props) => {
                     addMessage(messageQueueRef, {
                         type: "bot",
                         content: eventMessage.data.msg,
+                        turnId: currentTurnIdRef.current,
                         optional:
                             typeof eventMessage?.data?.optional === "boolean"
                                 ? eventMessage.data.optional
@@ -290,7 +301,8 @@ const ChatBoxMessagePanel: FunctionComponent<PropsType> = (props) => {
                                 if (log) {
                                     addMessage(messageQueueRef, {
                                         type: "bot",
-                                        content: log
+                                        content: log,
+                                        turnId: currentTurnIdRef.current
                                     });
                                     createNewMsg = true;
                                 }
@@ -313,7 +325,8 @@ const ChatBoxMessagePanel: FunctionComponent<PropsType> = (props) => {
                                     // Besides, only text based observation will reveal the agent's thinking process
                                     addMessage(messageQueueRef, {
                                         type: "bot",
-                                        content: observation
+                                        content: observation,
+                                        turnId: currentTurnIdRef.current
                                     });
                                     createNewMsg = true;
                                 }
@@ -322,7 +335,8 @@ const ChatBoxMessagePanel: FunctionComponent<PropsType> = (props) => {
                     } else if (output) {
                         addMessage(messageQueueRef, {
                             type: "bot",
-                            content: output
+                            content: output,
+                            turnId: currentTurnIdRef.current
                         });
                         createNewMsg = true;
                     }
@@ -340,6 +354,11 @@ const ChatBoxMessagePanel: FunctionComponent<PropsType> = (props) => {
                         addMessage(messageQueueRef, {
                             type: "bot",
                             content: String(eventMessage.data.msg),
+                            turnId: currentTurnIdRef.current,
+                            title:
+                                typeof eventMessage?.data?.title === "string"
+                                    ? eventMessage.data.title
+                                    : "System Logs",
                             optional:
                                 typeof eventMessage?.data?.optional ===
                                 "boolean"
@@ -387,27 +406,77 @@ const ChatBoxMessagePanel: FunctionComponent<PropsType> = (props) => {
     return (
         <Panel bordered className="magda-chat-box-message-panel">
             <List size="lg">
-                {messageQueueRef.current.map((item, index) =>
-                    messageQueueRef.current?.length === index + 1 &&
-                    !showPartialMessageBox ? (
-                        <List.Item
-                            key={index}
-                            ref={lastMessageItemRef}
-                            index={index}
-                            className={`${item.type}-message markdown-body`}
-                        >
-                            <TextPreview source={item.content} />
-                        </List.Item>
-                    ) : (
-                        <List.Item
-                            key={index}
-                            index={index}
-                            className={`${item.type}-message markdown-body`}
-                        >
-                            <TextPreview source={item.content} />
-                        </List.Item>
-                    )
-                )}
+                {(() => {
+                    const logsByTurn = new Map<number, MessageItem[]>();
+                    messageQueueRef.current
+                        .filter((item) => item.optional)
+                        .forEach((item) => {
+                            const turn = item.turnId || 0;
+                            const arr = logsByTurn.get(turn) || [];
+                            arr.push(item);
+                            logsByTurn.set(turn, arr);
+                        });
+                    const insertedTurns = new Set<number>();
+                    const nonOptionalMessages = messageQueueRef.current.filter(
+                        (item) => !item.optional
+                    );
+                    const nodes: React.ReactNode[] = [];
+                    nonOptionalMessages.forEach((item, index) => {
+                        const turn = item.turnId || 0;
+                        const turnLogs = logsByTurn.get(turn) || [];
+                        const shouldInsertLogsHere =
+                            item.type !== "user" &&
+                            turnLogs.length > 0 &&
+                            !insertedTurns.has(turn);
+                        if (shouldInsertLogsHere) {
+                            insertedTurns.add(turn);
+                            const combinedTurnLogs = turnLogs
+                                .map(
+                                    (logItem, logIndex) =>
+                                        `#### ${
+                                            logItem.title || "System Logs"
+                                        } ${logIndex + 1}\n${logItem.content}`
+                                )
+                                .join("\n\n---\n\n");
+                            nodes.push(
+                                <List.Item
+                                    key={`turn-log-${turn}`}
+                                    index={index}
+                                    className={`bot-message markdown-body`}
+                                >
+                                    <details>
+                                        <summary>{`System Logs (${turnLogs.length})`}</summary>
+                                        <TextPreview
+                                            source={combinedTurnLogs}
+                                        />
+                                    </details>
+                                </List.Item>
+                            );
+                        }
+                        nodes.push(
+                            nonOptionalMessages?.length === index + 1 &&
+                                !showPartialMessageBox ? (
+                                <List.Item
+                                    key={`msg-${index}`}
+                                    ref={lastMessageItemRef}
+                                    index={index}
+                                    className={`${item.type}-message markdown-body`}
+                                >
+                                    <TextPreview source={item.content} />
+                                </List.Item>
+                            ) : (
+                                <List.Item
+                                    key={`msg-${index}`}
+                                    index={index}
+                                    className={`${item.type}-message markdown-body`}
+                                >
+                                    <TextPreview source={item.content} />
+                                </List.Item>
+                            )
+                        );
+                    });
+                    return nodes;
+                })()}
                 {showPartialMessageBox ? (
                     <List.Item
                         key="working-message"

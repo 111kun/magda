@@ -132,6 +132,18 @@ const DEFAULT_MODEL_CONFIG: WebLLMInputs = {
     }
 };
 
+/** Merge chat options like createDefaultModel, for in-place engine reload without remounting. */
+export function mergeWebLLMChatOptions(
+    current?: webllm.ChatOptions,
+    patch?: webllm.ChatOptions
+): webllm.ChatOptions {
+    return {
+        ...(DEFAULT_MODEL_CONFIG.chatOptions as webllm.ChatOptions),
+        ...(current || {}),
+        ...(patch || {})
+    };
+}
+
 export default class ChatWebLLM extends SimpleChatModel<WebLLMCallOptions> {
     static inputs: WebLLMInputs;
 
@@ -242,6 +254,12 @@ export default class ChatWebLLM extends SimpleChatModel<WebLLMCallOptions> {
             return engine;
         }
         await engine.reload(modelId, newChatOpts);
+        if (newChatOpts) {
+            this.chatOptions = mergeWebLLMChatOptions(
+                this.chatOptions,
+                newChatOpts
+            );
+        }
         return engine;
     }
 
