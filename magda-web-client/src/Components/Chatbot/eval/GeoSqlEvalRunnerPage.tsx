@@ -5,21 +5,25 @@ import React, {
     useRef,
     useState
 } from "react";
+import type { Location } from "history";
 import type { InitProgressReport } from "@mlc-ai/web-llm";
-import ChatWebLLM from "../ChatWebLLM";
 import {
-    getPGlitePostgisEval,
     importSpatialFromDistribution,
-    runPostgisQueryEval
+    runPostgisQuery
 } from "../../../libs/pglitePostgis";
+import type { ChatEventMessage } from "../Messaging";
+import { EVENT_TYPE_RUN_LOG } from "../Messaging";
+import AgentChain from "../AgentChain";
+import { getDistributionUrl } from "../tools/queryGeoDataset/distribution";
 import {
-    planGeoSqlQuery,
-    queryGeoSpatialWithSQLQuery
-} from "../tools/queryGeoDataset";
-import {
-    classifySpatialIntentForEval,
-    GeoSqlEvalPlan
-} from "./GeoSqlEvalService";
+    applyGoldSqlCompatView,
+    buildParsedDatasetForGeoEval,
+    createGeoEvalAgentChain,
+    registerGeoEvalDatasetMappings,
+    resetGeoEvalDistributionMappings
+} from "./geoEvalFixtures";
+import type { GeoEvalDatasetMeta } from "./geoEvalFixtures";
+import type { GeoSqlEvalPlan } from "./GeoSqlEvalService";
 
 type EvalCase = {
     id: string;
@@ -31,18 +35,7 @@ type EvalCase = {
     ddl_files?: string[];
 };
 
-type DatasetMeta = {
-    id: string;
-    label: string;
-    ddl_file: string;
-    jsonl_file: string;
-    zip_file: string | null;
-    table: string;
-    columns: string[];
-    cases_total: number;
-    cases_single_table: number;
-    cases_multi_table: number;
-};
+type DatasetMeta = GeoEvalDatasetMeta;
 
 type CaseResult = {
     case_id: string;
@@ -126,7 +119,6 @@ type AllDatasetsReport = {
 
 const DEFAULT_MODEL = "Hermes-3-Llama-3.1-8B-q4f16_1-MLC";
 const META_URL = "/eval-data/datasets-meta.json";
-const MAX_IMPORT_FEATURES = 1000;
 
 type PgExecResult = {
     ok: boolean;
@@ -152,6 +144,9 @@ function hashRows(rows: Record<string, any>[]): string {
 
 function classifyExecutionError(message?: string): string {
     const msg = (message || "").toLowerCase();
+    if (msg === "no_executed_sql" || msg === "no_generated_sql") {
+        return "unknown";
+    }
     if (msg.includes("syntax error")) return "syntax";
     if (msg.includes("does not exist") || msg.includes("column"))
         return "schema";
@@ -163,12 +158,13 @@ function classifyExecutionError(message?: string): string {
     return "unknown";
 }
 
+/** Gold / generated SQL execution uses the same production PGLite as AgentChain. */
 async function executeSql(sql: string): Promise<PgExecResult> {
     if (!sql?.trim()) {
         return { ok: false, rows: [], hash: null, error: "empty SQL" };
     }
     try {
-        const rows = await runPostgisQueryEval(sql);
+        const rows = await runPostgisQuery(sql);
         return { ok: true, rows, hash: hashRows(rows) };
     } catch (e) {
         return {
@@ -180,54 +176,70 @@ async function executeSql(sql: string): Promise<PgExecResult> {
     }
 }
 
-/**
- * Match production Magda import path (`importSpatialFromDistribution`) into the
- * isolated eval PGLite DB, then apply the gold_sql compat VIEW on top.
- */
-async function bootstrapEvalDatasetWithProductionImport(opts: {
-    table: string;
-    zipFile: string;
-}): Promise<{
-    inserted: number;
-    truncated: boolean;
-    totalFeatures: number;
-    sampleYaml: string;
-}> {
-    const { table, zipFile } = opts;
-    const base =
-        typeof window !== "undefined" && window.location?.origin
-            ? window.location.origin
-            : "";
-    const zipUrl = `${base}/eval-data/tiger-files/${zipFile}`;
-    const importResult = await importSpatialFromDistribution(
-        zipUrl,
-        "SHAPEFILE",
-        table,
-        { maxFeatures: MAX_IMPORT_FEATURES, pgliteTarget: "eval" }
-    );
-    const viewResp = await fetch(`/eval-data/features-views/${table}.sql`);
-    if (!viewResp.ok) {
-        throw new Error(
-            `Missing compat view for ${table} (${viewResp.status}). Run: node geosql-eval/scripts/sync-eval-assets.mjs`
-        );
+/** Same text as `createChain` run log: `Router action: ${action}. ${reason}` */
+function parseRouterActionFromRunLog(
+    msg: string
+): {
+    action: string;
+    reason: string;
+} | null {
+    const prefix = "Router action: ";
+    if (!msg.startsWith(prefix)) {
+        return null;
     }
-    const viewSql = await viewResp.text();
-    const pg = await getPGlitePostgisEval();
-    await pg.exec(viewSql);
-    const sampleRows = await runPostgisQueryEval(
-        `SELECT jsonb_build_object('id', id, 'properties', properties) AS row FROM features ORDER BY id LIMIT 8`
-    );
-    const sampleYaml = JSON.stringify(
-        sampleRows.map((r) => r.row),
-        null,
-        2
-    );
+    const rest = msg.slice(prefix.length);
+    const dot = rest.indexOf(". ");
+    if (dot === -1) {
+        const action = rest.trim();
+        return action ? { action, reason: "" } : null;
+    }
     return {
-        inserted: importResult.inserted,
-        truncated: importResult.truncated,
-        totalFeatures: importResult.totalFeatures,
-        sampleYaml
+        action: rest.slice(0, dot).trim(),
+        reason: rest.slice(dot + 2).trim()
     };
+}
+
+type DrainChainOutcome = { route?: string; routeSource?: string };
+
+type DrainChainStreamOptions = {
+    /** Mirror System Logs into the eval panel so long WebLLM steps do not look hung. */
+    onRunLog?: (msg: string) => void;
+    /** Cap forwarded run_log size (GeoSQL blocks can be large). */
+    maxRunLogChars?: number;
+};
+
+/**
+ * Drains the stream queue. Also extracts the last router line from run_log
+ * events (no extra `decideChatRoute` — that already runs inside `chain.stream`).
+ */
+async function drainChainStream(
+    iter: AsyncIterable<unknown>,
+    opts?: DrainChainStreamOptions
+): Promise<DrainChainOutcome> {
+    const maxRun = opts?.maxRunLogChars ?? 600;
+    let route: string | undefined;
+    let routeSource: string | undefined;
+    for await (const ev of iter) {
+        if (
+            ev &&
+            typeof ev === "object" &&
+            "event" in (ev as object) &&
+            (ev as ChatEventMessage).event === EVENT_TYPE_RUN_LOG
+        ) {
+            const msg = String((ev as ChatEventMessage).data?.msg ?? "");
+            if (opts?.onRunLog && msg.trim()) {
+                opts.onRunLog(
+                    msg.length > maxRun ? `${msg.slice(0, maxRun)}…` : msg
+                );
+            }
+            const parsed = parseRouterActionFromRunLog(msg);
+            if (parsed) {
+                route = parsed.action;
+                routeSource = parsed.reason;
+            }
+        }
+    }
+    return { route, routeSource };
 }
 
 function inferOpFamily(sql: string | undefined): string {
@@ -354,49 +366,6 @@ function downloadJson(filename: string, data: unknown) {
     setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
-function buildEvalChainInput(
-    model: ChatWebLLM,
-    question: string,
-    propertyKeys: string[],
-    distTitle: string
-) {
-    return {
-        appName: "geosql-eval",
-        question,
-        // queue/history/location are required by ChainInput typing but not
-        // touched by GeoSqlEvalService planner/router/sanitizer.
-        queue: { push: () => undefined, done: () => undefined } as any,
-        history: {} as any,
-        location: { pathname: "/eval/geosql" } as any,
-        model,
-        dataset: undefined,
-        distribution: undefined,
-        keyContextData: {
-            queryResult: undefined,
-            datasetProfile: {
-                versionKey: "eval",
-                locationType: "DATASET_PAGE" as const,
-                distributionCount: 1,
-                tabular: { status: "not_loaded" as const, items: [] },
-                spatial: {
-                    status: "ready" as const,
-                    items: [
-                        {
-                            distributionIndex: 0,
-                            title: distTitle,
-                            format: "geojson",
-                            status: "ready" as const,
-                            propertyKeys: propertyKeys.length
-                                ? propertyKeys
-                                : ["name", "fullname", "namelsad", "geom"]
-                        }
-                    ]
-                }
-            }
-        }
-    } as any;
-}
-
 const GeoSqlEvalRunnerPage: React.FC = () => {
     const [tag, setTag] = useState("baseline");
     const [modelName, setModelName] = useState(DEFAULT_MODEL);
@@ -408,7 +377,7 @@ const GeoSqlEvalRunnerPage: React.FC = () => {
     const [running, setRunning] = useState(false);
     const [report, setReport] = useState<Report | null>(null);
     const [logs, setLogs] = useState<string[]>([]);
-    const modelRef = useRef<ChatWebLLM | null>(null);
+    const evalChainRef = useRef<AgentChain | null>(null);
 
     const appendLog = useCallback((msg: string) => {
         setLogs((prev) => [
@@ -438,7 +407,7 @@ const GeoSqlEvalRunnerPage: React.FC = () => {
                 appendLog(
                     `Could not load dataset presets (${
                         (e as Error).message
-                    }). Run 'node geosql-eval/scripts/sync-eval-assets.mjs' to enable presets, or paste JSONL manually below.`
+                    }). From magda-web-client run \`npm run sync-eval-data\` (writes public/eval-data/) to enable presets, or paste JSONL manually below.`
                 );
             });
     }, [appendLog]);
@@ -473,29 +442,37 @@ const GeoSqlEvalRunnerPage: React.FC = () => {
         reader.readAsText(file);
     }, []);
 
-    const initModel = useCallback(async () => {
-        if (modelRef.current) {
-            return modelRef.current;
+    useEffect(() => {
+        evalChainRef.current = null;
+    }, [modelName]);
+
+    const initEvalAgentChain = useCallback(async () => {
+        if (evalChainRef.current) {
+            return evalChainRef.current;
         }
-        appendLog(`Initialising WebLLM model: ${modelName}`);
-        const model = ChatWebLLM.createDefaultModel({
-            model: modelName,
-            loadProgressCallback: (report: InitProgressReport) => {
-                setProgress(
-                    `${report.text} (${(report.progress * 100).toFixed(1)}%)`
-                );
-            }
+        appendLog(`Creating isolated AgentChain + WebLLM (${modelName})…`);
+        const chain = createGeoEvalAgentChain((report: InitProgressReport) => {
+            setProgress(
+                `${report.text} (${(report.progress * 100).toFixed(1)}%)`
+            );
         });
-        await model.initialize();
-        modelRef.current = model;
-        appendLog("WebLLM model initialised.");
+        await chain.initialize((e) =>
+            appendLog(`WebLLM init error: ${String(e)}`)
+        );
+        await chain.updateModelConfig({ model: modelName }, (e) =>
+            appendLog(`Model config: ${String(e)}`)
+        );
+        evalChainRef.current = chain;
+        appendLog(
+            "Eval harness ready: production AgentChain + datasetProfile enrichment + fake registry URLs → /eval-data."
+        );
         setProgress("Model ready.");
-        return model;
+        return chain;
     }, [appendLog, modelName]);
 
     const evaluateCasesForDataset = useCallback(
         async (
-            model: ChatWebLLM,
+            agentChain: AgentChain,
             sourceCases: EvalCase[],
             datasetMeta: DatasetMeta | null
         ) => {
@@ -508,132 +485,98 @@ const GeoSqlEvalRunnerPage: React.FC = () => {
                 );
                 return null;
             }
-            const propKeys = datasetMeta?.columns || [];
-            const distTitle = datasetMeta?.table || "eval-dist";
-            const datasetId = datasetMeta?.id || "manual";
-            const startedAt = new Date().toISOString();
-            const results: CaseResult[] = [];
-            let sampleYaml = "[]";
-            const zipBase =
-                typeof window !== "undefined" && window.location?.origin
-                    ? window.location.origin
-                    : "";
-            const evalZipUrl = datasetMeta?.zip_file
-                ? `${zipBase}/eval-data/tiger-files/${datasetMeta.zip_file}`
-                : "";
-            const evalDistItems = [
-                {
-                    idx: 0,
-                    dist: {
-                        // IMPORTANT: keep planner/tool grounded on `features` only.
-                        // Do not surface TIGER table names here; otherwise the model
-                        // may incorrectly query `tl_...` instead of `features`.
-                        title: "eval_spatial_0",
-                        format: "ESRI SHAPEFILE",
-                        downloadURL: evalZipUrl
-                    } as any
-                }
-            ];
-
-            if (datasetMeta?.zip_file) {
-                const loaded = await bootstrapEvalDatasetWithProductionImport({
-                    table: datasetMeta.table,
-                    zipFile: datasetMeta.zip_file
-                });
-                sampleYaml = loaded.sampleYaml;
+            if (!datasetMeta?.zip_file) {
                 appendLog(
-                    `[${datasetId}] production-path import (eval PGLite): ${
-                        loaded.inserted
-                    }/${loaded.totalFeatures} rows in \`features\`${
-                        loaded.truncated ? " (truncated)" : ""
-                    }; compat VIEW ${datasetMeta.table} applied`
+                    "Dataset preset missing zip_file — cannot map fake download URL to local static assets."
                 );
-            } else {
-                appendLog(
-                    `[${datasetId}] no tiger zip mapped; Layer B / gold execution may fail.`
-                );
+                return null;
             }
 
-            const propKeysForPlanner = propKeys.filter(
-                (k) => k && k.toLowerCase() !== "geom"
-            );
-            const metadataBrief =
-                `Magda-style geosql eval: imported spatial data lives in table \`features\` (id, properties JSONB, geom). ` +
-                `Planner must emit SQL against \`features\` only. ` +
-                `Property keys (from profile / shapefile attributes): ${
-                    propKeysForPlanner.join(", ") || "N/A"
-                }.`;
+            const distTitle = datasetMeta.table || "eval-dist";
+            const datasetId = datasetMeta.id || "manual";
+            const startedAt = new Date().toISOString();
+            const results: CaseResult[] = [];
 
-            const fileDescItems = [
-                [
-                    "schema_binding:",
-                    "  table: features",
-                    "  properties_schema:",
-                    "    existing_keys:",
-                    ...propKeysForPlanner.map((k) => `      - ${k}`)
-                ].join("\n"),
-                `sample_imported_rows (truncated JSON):\n${sampleYaml}`
-            ];
+            resetGeoEvalDistributionMappings();
+            registerGeoEvalDatasetMappings(datasetMeta);
+            const parsed = buildParsedDatasetForGeoEval(datasetMeta);
+            agentChain.setDataset(parsed);
+            agentChain.setDistribution(undefined);
+            agentChain.setNavLocation({
+                pathname: `/dataset/geosql-eval-${datasetId}`,
+                search: "",
+                hash: "",
+                state: undefined,
+                key: "default"
+            } as Location);
+            agentChain.clearDatasetProfileCache();
+
+            appendLog(
+                `[${datasetId}] Warmup: enrichSpatialProfile (production import + profile)…`
+            );
+            await drainChainStream(await agentChain.stream("."), {
+                onRunLog: (m) => appendLog(`[${datasetId}] warmup: ${m}`)
+            });
+            appendLog(`[${datasetId}] Applying gold-sql compat VIEW…`);
+            await applyGoldSqlCompatView(datasetMeta.table);
+
+            const evalDist = parsed.distributions[0];
+            const evalUrl = getDistributionUrl(evalDist);
+            if (!evalUrl) {
+                appendLog(
+                    `[${datasetId}] No distribution URL for eval import — aborting.`
+                );
+                return null;
+            }
+            appendLog(
+                `[${datasetId}] One-time full spatial load for eval (PostGIS \`features\`; zip import may take several minutes)…`
+            );
+            await importSpatialFromDistribution(
+                evalUrl,
+                evalDist.format,
+                evalDist.title
+            );
+            appendLog(`[${datasetId}] Full spatial load finished.`);
 
             for (let i = 0; i < cases.length; i++) {
                 const caseItem = cases[i];
                 appendLog(
                     `[${datasetId}] [${i + 1}/${cases.length}] ${
                         caseItem.id
-                    } - running`
+                    } — AgentChain + WebLLM GeoSQL (browser planner can take several minutes per case; logs follow).`
                 );
-                const input = buildEvalChainInput(
-                    model,
-                    caseItem.question,
-                    propKeys,
-                    distTitle
-                );
-                (input as any).__geoDistItems = evalDistItems;
-                (input as any).__geoMetadataBrief = metadataBrief;
-                (input as any).__geoFileDescItems = fileDescItems;
-                (input as any).__geoProfilePropertyKeysByIdx = {
-                    0: propKeysForPlanner
-                };
-                (input as any).__geoEvalPgliteTarget = "eval";
-                (input as any).__geoEvalSkipImport = true;
 
                 let route = "unknown";
                 let routeSource = "fallback";
-                let plan: GeoSqlEvalPlan = {
-                    type: "not_applicable",
-                    reason: "Not run"
-                };
+                let plannerType: GeoSqlEvalPlan["type"] = "not_applicable";
                 let finalSql = "";
                 let firstSql = "";
                 let fixes: string[] = [];
                 let errorCategory: string | null = null;
                 let prodReturned: string | null = null;
-                try {
-                    const intent = await classifySpatialIntentForEval(input);
-                    route = intent.route;
-                    routeSource = intent.source;
-                    (input as any).__geoIntent = intent;
 
-                    plan = await planGeoSqlQuery.call(
-                        input,
-                        evalDistItems,
-                        metadataBrief,
-                        fileDescItems
+                try {
+                    const drained = await drainChainStream(
+                        await agentChain.stream(caseItem.question, {
+                            geoEvalCaptureExecutedSql: true
+                        }),
+                        {
+                            onRunLog: (m) =>
+                                appendLog(
+                                    `[${datasetId}] [${caseItem.id}] ${m}`
+                                )
+                        }
                     );
-                    if (plan.type === "query") {
-                        firstSql = plan.sqlQuery || "";
-                        prodReturned = await queryGeoSpatialWithSQLQuery.call(
-                            input,
-                            plan.distributionIndex,
-                            plan.sqlQuery,
-                            plan.placeName,
-                            plan.countrycodes
-                        );
-                        finalSql =
-                            (input as any).__geoEvalExecutedSqlFinal || "";
-                        const sf = (input as any).__geoEvalSanitizerFixes;
-                        fixes = Array.isArray(sf) ? sf : [];
-                    }
+                    route = drained.route ?? "unknown";
+                    routeSource = drained.routeSource ?? "fallback";
+                    const cap = agentChain.lastEvalChainInput;
+                    finalSql = cap?.evalCapturedExecutedSql?.trim() || "";
+                    firstSql = cap?.evalCapturedExecutedSqlFirst?.trim() || "";
+                    fixes = cap?.evalCapturedSanitizerFixes || [];
+                    prodReturned =
+                        finalSql || firstSql ? "__tool_finished__" : null;
+                    plannerType =
+                        finalSql || firstSql ? "query" : "not_applicable";
                 } catch (e) {
                     errorCategory = "runtime";
                     appendLog(
@@ -641,33 +584,27 @@ const GeoSqlEvalRunnerPage: React.FC = () => {
                     );
                 }
 
-                const hasQuery =
-                    plan.type === "query" &&
-                    !!firstSql.trim() &&
-                    !errorCategory;
+                const hasQuery = !!firstSql && !errorCategory;
                 const goldResult = await executeSql(caseItem.gold_sql || "");
-                const firstResult =
-                    plan.type === "query"
-                        ? await executeSql(firstSql)
-                        : {
-                              ok: false,
-                              rows: [],
-                              hash: null,
-                              error: "planner_not_query"
-                          };
-                const finalResult =
-                    plan.type === "query"
-                        ? await executeSql(finalSql)
-                        : {
-                              ok: false,
-                              rows: [],
-                              hash: null,
-                              error: "planner_not_query"
-                          };
+                const firstResult = firstSql
+                    ? await executeSql(firstSql)
+                    : {
+                          ok: false,
+                          rows: [],
+                          hash: null,
+                          error: "no_generated_sql"
+                      };
+                const finalResult = finalSql
+                    ? await executeSql(finalSql)
+                    : {
+                          ok: false,
+                          rows: [],
+                          hash: null,
+                          error: "no_executed_sql"
+                      };
 
                 const firstErr = errorCategory || firstResult.error;
-                const prodOk =
-                    plan.type === "query" ? prodReturned !== null : false;
+                const prodOk = prodReturned !== null;
                 const finalErr = errorCategory || finalResult.error;
                 const resultCorrectFirst =
                     goldResult.ok &&
@@ -688,15 +625,15 @@ const GeoSqlEvalRunnerPage: React.FC = () => {
                     layerA: {
                         syntax_valid_first: hasQuery,
                         execution_pass_first: firstResult.ok,
-                        execution_pass_final: prodOk,
+                        execution_pass_final: finalResult.ok,
                         error_category_first: firstErr
                             ? classifyExecutionError(firstErr)
-                            : plan.type === "not_applicable"
+                            : plannerType === "not_applicable"
                             ? "unknown"
                             : null,
                         error_category_final: finalErr
                             ? classifyExecutionError(finalErr)
-                            : plan.type === "not_applicable"
+                            : plannerType === "not_applicable"
                             ? "unknown"
                             : null
                     },
@@ -708,16 +645,15 @@ const GeoSqlEvalRunnerPage: React.FC = () => {
                         model_mode: "real-webllm",
                         route,
                         route_source: routeSource,
-                        planner_type: plan.type,
-                        generated_sql_first:
-                            plan.type === "query" ? firstSql : null,
+                        planner_type: plannerType,
+                        generated_sql_first: firstSql || null,
                         generated_sql_final: finalSql || null,
                         gold_sql: caseItem.gold_sql || null,
                         gold_rows_hash: goldResult.hash,
                         first_rows_hash: firstResult.hash,
                         final_rows_hash: finalResult.hash,
                         sanitizer_fixes: fixes,
-                        notes: `LayerB compare by result hash; gold_ok=${goldResult.ok}, first_ok=${firstResult.ok}, final_ok=${finalResult.ok}; production_query_tool_ok=${prodOk}`
+                        notes: `AgentChain path; fake URL→/eval-data; gold_ok=${goldResult.ok}, first_ok=${firstResult.ok}, final_ok=${finalResult.ok}; capture_ok=${prodOk}`
                     }
                 });
             }
@@ -729,7 +665,7 @@ const GeoSqlEvalRunnerPage: React.FC = () => {
                     dataset_table: distTitle,
                     started_at: startedAt,
                     finished_at: new Date().toISOString(),
-                    adapter: "browser-webllm-runner",
+                    adapter: "agentchain-production-parity",
                     cases_count: results.length,
                     model: modelName
                 },
@@ -759,9 +695,9 @@ const GeoSqlEvalRunnerPage: React.FC = () => {
 
         setRunning(true);
         try {
-            const model = await initModel();
+            const chain = await initEvalAgentChain();
             const built = await evaluateCasesForDataset(
-                model,
+                chain,
                 cases,
                 selectedDataset
             );
@@ -780,7 +716,7 @@ const GeoSqlEvalRunnerPage: React.FC = () => {
         appendLog,
         casesText,
         evaluateCasesForDataset,
-        initModel,
+        initEvalAgentChain,
         selectedDataset
     ]);
 
@@ -793,7 +729,7 @@ const GeoSqlEvalRunnerPage: React.FC = () => {
         }
         setRunning(true);
         try {
-            const model = await initModel();
+            const chain = await initEvalAgentChain();
             const startedAt = new Date().toISOString();
             const datasetReports: AllDatasetsReport["dataset_reports"] = [];
             const allResults: CaseResult[] = [];
@@ -806,7 +742,7 @@ const GeoSqlEvalRunnerPage: React.FC = () => {
                     ).then((r) => r.text());
                     const parsedCases = parseJsonl(casesRaw);
                     const built = await evaluateCasesForDataset(
-                        model,
+                        chain,
                         parsedCases,
                         ds
                     );
@@ -862,7 +798,7 @@ const GeoSqlEvalRunnerPage: React.FC = () => {
         appendLog,
         datasets,
         evaluateCasesForDataset,
-        initModel,
+        initEvalAgentChain,
         modelName,
         tag
     ]);
@@ -894,11 +830,13 @@ const GeoSqlEvalRunnerPage: React.FC = () => {
         >
             <h2>GeoSQL Eval Runner (Browser, real WebLLM)</h2>
             <p style={{ color: "#555" }}>
-                Per-dataset evaluation against <code>geosql-llm-eval</code>{" "}
-                JSONL, restricted to single-table cases only. Runs router +
-                planner + sanitizer with the same WebLLM model used by Magda's
-                chatbot. This page is dev/eval only and is not linked from the
-                main UI.
+                Single-table cases only. Uses an isolated{" "}
+                <code>AgentChain</code> (same <code>createChain</code> path as
+                the dataset chatbot): <code>datasetProfile</code> enrichment,{" "}
+                <code>decideChatRoute</code>, and <code>queryGeoDataset</code>.
+                Distribution download URLs are fake registry URLs rewritten to{" "}
+                <code>/eval-data/tiger-files/*.zip</code> via{" "}
+                <code>getDistributionUrl</code>. Dev/eval only.
             </p>
 
             <div
@@ -1002,6 +940,7 @@ const GeoSqlEvalRunnerPage: React.FC = () => {
 
             <div style={{ marginTop: 16 }}>
                 <button
+                    type="button"
                     onClick={runEval}
                     disabled={running}
                     style={{ padding: "8px 16px" }}
@@ -1009,6 +948,7 @@ const GeoSqlEvalRunnerPage: React.FC = () => {
                     {running ? "Running..." : "Run evaluation"}
                 </button>
                 <button
+                    type="button"
                     onClick={runAllDatasetsSingleTable}
                     disabled={running}
                     style={{ padding: "8px 16px", marginLeft: 8 }}
@@ -1019,6 +959,7 @@ const GeoSqlEvalRunnerPage: React.FC = () => {
                 </button>
                 {report && (
                     <button
+                        type="button"
                         onClick={() =>
                             downloadJson(
                                 `geosql-eval-report-${tag}-${report.run.dataset_id}.json`,

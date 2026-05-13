@@ -163,15 +163,27 @@ export async function sampleGeoPropertySchema(
     return fields.length ? fields : null;
 }
 
+export type GeoDistributionSampleHintOptions = {
+    /** When true, only read `features` — skip import (caller already loaded spatial). */
+    skipSpatialImport?: boolean;
+};
+
 export async function getGeoDistributionSampleHint(
-    dist: ParsedDistribution
+    dist: ParsedDistribution,
+    options?: GeoDistributionSampleHintOptions
 ): Promise<string | null> {
     const targetUrl = getDistributionUrl(dist);
     if (!targetUrl) {
         return null;
     }
     try {
-        await importSpatialFromDistribution(targetUrl, dist.format, dist.title);
+        if (!options?.skipSpatialImport) {
+            await importSpatialFromDistribution(
+                targetUrl,
+                dist.format,
+                dist.title
+            );
+        }
         const rows = await runPostgisQuery(
             `SELECT
                 id,

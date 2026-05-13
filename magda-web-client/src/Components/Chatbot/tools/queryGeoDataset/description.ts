@@ -18,6 +18,11 @@ import {
     sampleGeoPropertySchema
 } from "./schema";
 
+type BuildGeoFileSampleOptions = {
+    /** Skip `importSpatialFromDistribution` inside sample hints (spatial already loaded). */
+    skipSpatialImportForSample?: boolean;
+};
+
 type GeometryProfile = {
     status: "ok" | "sampling_failed";
     families: string[];
@@ -86,7 +91,8 @@ function buildDatasetMetadataBrief(
 }
 
 async function buildGeoFileProfiles(
-    distItems: { idx: number; dist: ParsedDistribution }[]
+    distItems: { idx: number; dist: ParsedDistribution }[],
+    sampleOptions?: BuildGeoFileSampleOptions
 ): Promise<GeoFileProfile[]> {
     const profiles: GeoFileProfile[] = [];
     const samplePreviewLimit = 2;
@@ -95,7 +101,10 @@ async function buildGeoFileProfiles(
         const dist = distItems[i].dist;
         const sampleHint =
             i < samplePreviewLimit
-                ? await getGeoDistributionSampleHint(dist)
+                ? await getGeoDistributionSampleHint(dist, {
+                      skipSpatialImport:
+                          sampleOptions?.skipSpatialImportForSample
+                  })
                 : null;
         let sampledPropertySchema: PropertySchemaBinding = {
             status: "sampling_failed",
@@ -177,7 +186,8 @@ async function buildGeoFileProfiles(
 
 async function buildGeoFileProfilesFromSpatialProfile(
     distItems: { idx: number; dist: ParsedDistribution }[],
-    spatialProfileItems: SpatialProfileItem[]
+    spatialProfileItems: SpatialProfileItem[],
+    sampleOptions?: BuildGeoFileSampleOptions
 ): Promise<GeoFileProfile[]> {
     const profileByIdx = new Map<number, SpatialProfileItem>();
     spatialProfileItems.forEach((item) =>
@@ -223,7 +233,12 @@ async function buildGeoFileProfilesFromSpatialProfile(
                   message: "No profiled keys found in datasetProfile."
               };
         const sampleHint =
-            i < 2 ? await getGeoDistributionSampleHint(dist) : null;
+            i < 2
+                ? await getGeoDistributionSampleHint(dist, {
+                      skipSpatialImport:
+                          sampleOptions?.skipSpatialImportForSample
+                  })
+                : null;
         profiles.push({
             id: idx,
             title: dist.title,
@@ -301,19 +316,24 @@ export async function buildGeoFileDescriptions(
 export async function buildGeoFileDescriptionsAndIntro(
     distItems: { idx: number; dist: ParsedDistribution }[],
     dataset?: ParsedDataset,
-    spatialProfileItems?: SpatialProfileItem[]
+    spatialProfileItems?: SpatialProfileItem[],
+    buildOptions?: BuildGeoFileSampleOptions
 ): Promise<{
     fileDescItems: string[];
     introContext: string | null;
     metadataBrief: string;
 }> {
+    const sampleOpts = buildOptions?.skipSpatialImportForSample
+        ? { skipSpatialImportForSample: true as const }
+        : undefined;
     const profiles =
         spatialProfileItems?.length && spatialProfileItems.length > 0
             ? await buildGeoFileProfilesFromSpatialProfile(
                   distItems,
-                  spatialProfileItems
+                  spatialProfileItems,
+                  sampleOpts
               )
-            : await buildGeoFileProfiles(distItems);
+            : await buildGeoFileProfiles(distItems, sampleOpts);
     const metadataBrief = buildDatasetMetadataBrief(dataset, distItems);
     return {
         fileDescItems: profiles.map((profile) => toYaml(profile)),

@@ -15,7 +15,8 @@
     "build-polyfills": "webpack --mode production --config polyfill-bundle.config.js",
     "test": "craco test --react-scripts ../node_modules/react-scripts",
     "eject": "react-scripts eject",
-    "analyze": "source-map-explorer 'build/static/js/*.js'"
+    "analyze": "source-map-explorer 'build/static/js/*.js'",
+    "sync-eval-data": "node scripts/sync-geosql-eval-data.mjs"
   },
   "cracoConfig": "craco.config.cjs",
   "dependencies": {

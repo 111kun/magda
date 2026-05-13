@@ -10,7 +10,7 @@
  *
  * Execution chain:
  * 1) createQueryGeoDatasetTool -> detect valid spatial distributions.
- * 2) createQueryGeoSpatialWithSQLQueryTool -> assemble prompt/metadata for LLM tool-calling.
+ * 2) createQueryGeoDatasetTool -> assemble prompt/metadata for LLM tool-calling.
  * 3) queryGeoSpatialWithSQLQuery -> import features, resolve place token, sanitize SQL.
  * 4) Execute SQL with one retry path (self-correction) on failure, then return markdown table.
  */
@@ -30,10 +30,7 @@ import { markdownTable } from "markdown-table";
 import { ParsedDistribution } from "helpers/record";
 import { config } from "../../../config";
 import { resolveReferencePoint } from "./queryGeoDataset/placeResolver";
-import {
-    buildGeoFileDescriptionsAndIntro,
-    buildGeoSqlToolDescription
-} from "./queryGeoDataset/description";
+import { buildGeoFileDescriptionsAndIntro } from "./queryGeoDataset/description";
 import {
     getDistributionUrl,
     isGeoSpatialDistribution
@@ -457,6 +454,10 @@ export async function planGeoSqlQuery(
         `${schemaContextLabel}:\n${
             fileDescItems?.length ? fileDescItems.join("\n---\n") : "N/A"
         }`;
+    pushGeoRunLog(
+        this,
+        "Calling WebLLM for GeoSQL JSON plan (non-streaming; may take minutes in browser)…"
+    );
     const reply = await engine.chat.completions.create({
         stream: false,
         messages: [
@@ -1539,6 +1540,9 @@ export async function queryGeoSpatialWithSQLQuery(
         try {
             if (attempt === 1) {
                 (this as any).__geoEvalExecutedSqlFirst = sqlToRun;
+                if (this.geoEvalCaptureExecutedSql) {
+                    this.evalCapturedExecutedSqlFirst = sqlToRun;
+                }
                 // Preflight parse to catch syntax errors before first execution.
                 try {
                     await runPostgisQuery(
@@ -1558,6 +1562,13 @@ export async function queryGeoSpatialWithSQLQuery(
             );
             records = await runPostgisQuery(sqlToRun, undefined, pgExec);
             (this as any).__geoEvalExecutedSqlFinal = sqlToRun;
+            if (this.geoEvalCaptureExecutedSql) {
+                this.evalCapturedExecutedSql = sqlToRun;
+                const fx = (this as any).__geoEvalSanitizerFixes;
+                this.evalCapturedSanitizerFixes = Array.isArray(fx)
+                    ? fx
+                    : undefined;
+            }
             break;
         } catch (e) {
             const errText = String(e);
@@ -1641,55 +1652,6 @@ export async function queryGeoSpatialWithSQLQuery(
         )
     ]);
     return `Query returned ${records.length} row(s).\n\n${table}`;
-}
-
-async function createQueryGeoSpatialWithSQLQueryTool(
-    distItems: {
-        idx: number;
-        dist: ParsedDistribution;
-    }[],
-    prebuiltFileDescItems?: string[],
-    metadataBrief?: string
-): Promise<WebLLMTool> {
-    const fileDescItems = prebuiltFileDescItems || [];
-
-    return {
-        name: "queryGeoSpatialWithSQLQuery",
-        func: queryGeoSpatialWithSQLQuery,
-        description: buildGeoSqlToolDescription(fileDescItems, metadataBrief),
-        parameters: [
-            {
-                name: "distributionIndex",
-                type: "integer" as const,
-                description:
-                    "The spatial file `id` from the list above (dataset distribution index). Loading replaces the current `features` table."
-            },
-            {
-                name: "sqlQuery",
-                type: "string" as const,
-                description:
-                    "Executable SQL only. Must start directly with SELECT or WITH. Do not include natural language, apologies, explanations, markdown code fences, JSON wrappers, comments, or labels. " +
-                    "A single PostGIS SELECT (or WITH) query against table `features`. Keep result rows at most 100. " +
-                    "Generate robust geometry logic (e.g. line queries should support both LINESTRING and MULTILINESTRING). " +
-                    "For numeric distance/length on lon-lat geometries, use geography casting for meter units. " +
-                    "When `placeName` is supplied, use token `__REF_POINT__` directly as the resolved SRID 4326 geometry expression. Do not use __REF_POINT__.lon/__REF_POINT__.lat or wrap it in ST_MakePoint."
-            },
-            {
-                name: "placeName",
-                type: "string" as const,
-                description:
-                    "Optional reference place text for distance/proximity queries (e.g. 'University of Sydney'). " +
-                    "Resolution order: current dataset first, then Nominatim fallback."
-            },
-            {
-                name: "countrycodes",
-                type: "string" as const,
-                description:
-                    "Optional ISO country code filter for fallback Nominatim geocoding (default: au)."
-            }
-        ],
-        requiredParameters: ["distributionIndex", "sqlQuery"]
-    };
 }
 
 export async function createQueryGeoDatasetTool(
@@ -1783,7 +1745,10 @@ export async function createQueryGeoDatasetTool(
         const prepared = await buildGeoFileDescriptionsAndIntro(
             dists,
             dataset,
-            spatialProfileItems
+            spatialProfileItems,
+            this.geoEvalCaptureExecutedSql
+                ? { skipSpatialImportForSample: true }
+                : undefined
         );
         (this as ChainInput & {
             __geoMetadataBrief?: string;
@@ -1798,7 +1763,7 @@ export async function createQueryGeoDatasetTool(
         const introShownKey = (this as ChainInput & {
             __geoIntroShownKey?: string;
         }).__geoIntroShownKey;
-        if (introShownKey !== introKey) {
+        if (introShownKey !== introKey && !this.geoEvalCaptureExecutedSql) {
             const generatedIntro = await generateGeoDatasetIntro(
                 this,
                 prepared.introContext

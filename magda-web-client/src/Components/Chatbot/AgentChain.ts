@@ -11,7 +11,6 @@ import {
     createChatEventMessage,
     EVENT_TYPE_PARTIAL_MSG,
     EVENT_TYPE_PARTIAL_MSG_FINISH,
-    EVENT_TYPE_ERROR,
     createChatEventMessageErrorMsg,
     createChatEventRunLogMsg
 } from "./Messaging";
@@ -88,6 +87,11 @@ class AgentChain {
     public debug: boolean = false;
     public directModelAccess: boolean = false;
     public chain: Runnable<CommonInputType, string | null | undefined | void>;
+    /** Latest ChainInput built by `stream()` — for eval harness to read captured SQL. */
+    public lastEvalChainInput?: ChainInput;
+
+    /** Merged into every `ChatWebLLM.createDefaultModel` (constructor + model switch). */
+    private webLlmCreateOptions: Partial<WebLLMInputs> = {};
 
     constructor(
         appName: string,
@@ -95,11 +99,17 @@ class AgentChain {
         navHistory: History,
         dataset: ParsedDataset | undefined,
         distribution: ParsedDistribution | undefined,
-        loadProgressCallback?: InitProgressCallback
+        loadProgressCallback?: InitProgressCallback,
+        options?: {
+            attachToWindowDebug?: boolean;
+            webLlmCreateOptions?: Partial<WebLLMInputs>;
+        }
     ) {
         this.loadProgressCallback = loadProgressCallback;
+        this.webLlmCreateOptions = options?.webLlmCreateOptions || {};
         this.model = ChatWebLLM.createDefaultModel({
-            loadProgressCallback: this.onProgress.bind(this)
+            loadProgressCallback: this.onProgress.bind(this),
+            ...this.webLlmCreateOptions
         });
         this.appName = appName;
         this.navHistory = navHistory;
@@ -107,8 +117,15 @@ class AgentChain {
         this.dataset = dataset;
         this.distribution = distribution;
         this.chain = this.createChain();
-        // for debug purpose;
-        (window as any).chatBotAgentChain = this;
+        if (options?.attachToWindowDebug !== false) {
+            (window as any).chatBotAgentChain = this;
+        }
+    }
+
+    clearDatasetProfileCache(): void {
+        this.keyContextData.datasetProfile = undefined;
+        this.keyContextData.datasetProfileVersionKey = undefined;
+        this.keyContextData.datasetProfileUpdatedAt = undefined;
     }
 
     async updateModelConfig(
@@ -165,6 +182,7 @@ class AgentChain {
         });
         this.model.getEngine().then((engine) => engine.unload());
         this.model = ChatWebLLM.createDefaultModel({
+            ...this.webLlmCreateOptions,
             ...modelConfig,
             loadProgressCallback: this.onProgress.bind(this)
         });
@@ -222,7 +240,10 @@ class AgentChain {
         }
     }
 
-    async stream(question: string): Promise<AsyncIterable<ChatEventMessage>> {
+    async stream(
+        question: string,
+        streamOpts?: { geoEvalCaptureExecutedSql?: boolean }
+    ): Promise<AsyncIterable<ChatEventMessage>> {
         const queue = new AsyncQueue<ChatEventMessage>();
         const input: ChainInput = {
             question,
@@ -233,53 +254,80 @@ class AgentChain {
             model: this.model,
             dataset: this.dataset,
             distribution: this.distribution,
-            keyContextData: this.keyContextData
+            keyContextData: this.keyContextData,
+            geoEvalCaptureExecutedSql: streamOpts?.geoEvalCaptureExecutedSql
         };
+        if (streamOpts?.geoEvalCaptureExecutedSql) {
+            (input as any).__geoEvalSkipImport = true;
+        }
+        this.lastEvalChainInput = input;
 
-        new Promise(async (resolve, reject) => {
-            const msgId = uuidv4();
-            let buffer = "";
-            let partialMsgSent = false;
-
-            const stream = await (this.directModelAccess
-                ? this.model.stream(input.question)
-                : this.chain.stream(input));
-
-            for await (const chunk of stream) {
-                if (chunk === null || typeof chunk === "undefined") {
-                    continue;
+        void (async () => {
+            const finishQueue = () => {
+                try {
+                    queue.done();
+                } catch (doneErr) {
+                    if (typeof console !== "undefined" && console.error) {
+                        console.error(
+                            "AgentChain.stream: queue.done failed",
+                            doneErr
+                        );
+                    }
                 }
-                partialMsgSent = true;
-                const chunkText =
-                    typeof chunk === "string" ? chunk : chunk.content;
-                queue.push(
-                    createChatEventMessage(EVENT_TYPE_PARTIAL_MSG, {
-                        id: msgId,
-                        msg: chunkText
-                    })
-                );
-                buffer += chunkText;
+            };
+            try {
+                const msgId = uuidv4();
+                let buffer = "";
+                let partialMsgSent = false;
+
+                const stream = await (this.directModelAccess
+                    ? this.model.stream(input.question)
+                    : this.chain.stream(input));
+
+                for await (const chunk of stream) {
+                    if (chunk === null || typeof chunk === "undefined") {
+                        continue;
+                    }
+                    partialMsgSent = true;
+                    const chunkText =
+                        typeof chunk === "string" ? chunk : chunk.content;
+                    queue.push(
+                        createChatEventMessage(EVENT_TYPE_PARTIAL_MSG, {
+                            id: msgId,
+                            msg: chunkText
+                        })
+                    );
+                    buffer += chunkText;
+                }
+                if (partialMsgSent) {
+                    queue.push(
+                        createChatEventMessage(EVENT_TYPE_PARTIAL_MSG_FINISH, {
+                            id: msgId
+                        })
+                    );
+                }
+                if (this.debug) {
+                    this.chatHistory.push(new AIMessage({ content: buffer }));
+                }
+                if (this.directModelAccess) {
+                    console.log(buffer);
+                }
+            } catch (e) {
+                try {
+                    queue.push(createChatEventMessageErrorMsg(e as Error));
+                } catch (pushErr) {
+                    if (typeof console !== "undefined" && console.error) {
+                        console.error(
+                            "AgentChain.stream: failed to push error event",
+                            pushErr
+                        );
+                    }
+                }
+            } finally {
+                finishQueue();
             }
-            if (partialMsgSent) {
-                queue.push(
-                    createChatEventMessage(EVENT_TYPE_PARTIAL_MSG_FINISH, {
-                        id: msgId
-                    })
-                );
-            }
-            queue.done();
-            if (this.debug) {
-                this.chatHistory.push(new AIMessage({ content: buffer }));
-            }
-            if (this.directModelAccess) {
-                console.log(buffer);
-            }
-            resolve(buffer);
-        }).catch((e) => {
-            createChatEventMessage(EVENT_TYPE_ERROR, {
-                error: e
-            });
-        });
+        })();
+
         return queue;
     }
 

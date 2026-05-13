@@ -101,6 +101,11 @@ export interface ChainInput {
     keyContextData: KeyContextData;
     /** Set by AgentChain before spatial routing when a dataset profile is available. */
     spatialCoverage?: SpatialCoverageHint;
+    /** GeoSQL eval harness: queryGeoDataset fills executed SQL after a successful run. */
+    geoEvalCaptureExecutedSql?: boolean;
+    evalCapturedExecutedSqlFirst?: string;
+    evalCapturedExecutedSql?: string;
+    evalCapturedSanitizerFixes?: string[];
 }
 
 export function getLocationType(location: Location): LocationType {

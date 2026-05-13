@@ -1,5 +1,6 @@
 import { ParsedDistribution } from "helpers/record";
 import resolveDistributionResourceUrl from "helpers/resolveDistributionResourceUrl";
+import { rewriteEvalDistributionSourceUrl } from "../../eval/evalDistributionUrlMap";
 
 const SPATIAL_FORMATS = new Set([
     "SHP",
@@ -20,11 +21,11 @@ function normalizeFormat(format?: string): string {
 }
 
 export function getDistributionUrl(dist: ParsedDistribution): string | null {
-    const sourceUrl =
-        dist?.accessURL?.trim() || dist?.downloadURL?.trim() || "";
-    if (!sourceUrl) {
+    const raw = dist?.accessURL?.trim() || dist?.downloadURL?.trim() || "";
+    if (!raw) {
         return null;
     }
+    const sourceUrl = rewriteEvalDistributionSourceUrl(raw);
     return resolveDistributionResourceUrl(sourceUrl, {
         distributionId: dist?.identifier
     });
