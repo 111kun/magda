@@ -8,7 +8,6 @@ import {
     importSpatialFromDistribution,
     runPostgisQuery
 } from "../../../../libs/pglitePostgis";
-import type { PgliteQueryTarget } from "../../../../libs/pglitePostgis";
 import { ParsedDistribution } from "helpers/record";
 import toYaml from "libs/toYaml";
 import { getDistributionUrl } from "./distribution";
@@ -221,13 +220,9 @@ export async function getGeoDistributionSampleHint(
     }
 }
 
-export async function sampleGeoPropertyKeys(options?: {
-    pgliteTarget?: PgliteQueryTarget;
-}): Promise<string[] | null> {
+export async function sampleGeoPropertyKeys(): Promise<string[] | null> {
     const rows = await runPostgisQuery(
-        `SELECT properties FROM features WHERE properties IS NOT NULL LIMIT 3`,
-        undefined,
-        options
+        `SELECT properties FROM features WHERE properties IS NOT NULL LIMIT 3`
     );
     if (!rows?.length) {
         return null;

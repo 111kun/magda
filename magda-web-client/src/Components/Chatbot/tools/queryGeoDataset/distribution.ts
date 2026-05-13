@@ -26,9 +26,7 @@ export function getDistributionUrl(dist: ParsedDistribution): string | null {
         return null;
     }
     const sourceUrl = rewriteEvalDistributionSourceUrl(raw);
-    return resolveDistributionResourceUrl(sourceUrl, {
-        distributionId: dist?.identifier
-    });
+    return resolveDistributionResourceUrl(sourceUrl);
 }
 
 export function isGeoSpatialDistribution(dist: ParsedDistribution): boolean {

@@ -712,16 +712,6 @@ export interface ConfigDataType {
     enablePglitePostgis?: boolean;
 
     /**
-     * Whether to route distribution resource requests through local eval API.
-     */
-    evalLocalDistributionApiEnabled?: boolean;
-
-    /**
-     * Local eval API endpoint path for distribution resources.
-     */
-    evalLocalDistributionApiPath?: string;
-
-    /**
      * The extension ID of the web-llm service worker chrome extension plugin.
      * See here for more details: https://github.com/magda-io/magda-llm-service-worker-extension
      *
@@ -1145,13 +1135,6 @@ export const config: ConfigDataType = {
         typeof serverConfig?.enablePglitePostgis === "boolean"
             ? serverConfig.enablePglitePostgis
             : true,
-    evalLocalDistributionApiEnabled:
-        typeof serverConfig?.evalLocalDistributionApiEnabled === "boolean"
-            ? serverConfig.evalLocalDistributionApiEnabled
-            : false,
-    evalLocalDistributionApiPath: serverConfig?.evalLocalDistributionApiPath
-        ? serverConfig.evalLocalDistributionApiPath
-        : "",
     llmExtensionId: serverConfig?.llmExtensionId
         ? serverConfig.llmExtensionId
         : // this is the ID of the default extension allow access from domain magda.io

@@ -23,7 +23,9 @@ import {
     resetGeoEvalDistributionMappings
 } from "./geoEvalFixtures";
 import type { GeoEvalDatasetMeta } from "./geoEvalFixtures";
-import type { GeoSqlEvalPlan } from "./GeoSqlEvalService";
+
+/** Report trace only: real planner is inside AgentChain + queryGeoDataset. */
+type GeoSqlEvalPlannerTrace = "query" | "not_applicable";
 
 type EvalCase = {
     id: string;
@@ -59,7 +61,7 @@ type CaseResult = {
         model_mode: "real-webllm";
         route: string;
         route_source: string;
-        planner_type: GeoSqlEvalPlan["type"];
+        planner_type: GeoSqlEvalPlannerTrace;
         generated_sql_first: string | null;
         generated_sql_final: string | null;
         gold_sql: string | null;
@@ -548,7 +550,7 @@ const GeoSqlEvalRunnerPage: React.FC = () => {
 
                 let route = "unknown";
                 let routeSource = "fallback";
-                let plannerType: GeoSqlEvalPlan["type"] = "not_applicable";
+                let plannerType: GeoSqlEvalPlannerTrace = "not_applicable";
                 let finalSql = "";
                 let firstSql = "";
                 let fixes: string[] = [];

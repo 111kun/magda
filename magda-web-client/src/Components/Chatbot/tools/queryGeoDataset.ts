@@ -1046,11 +1046,6 @@ export async function queryGeoSpatialWithSQLQuery(
 ) {
     this.keyContextData.queryResult = undefined;
 
-    const evalIso =
-        (this as any).__geoEvalPgliteTarget === "eval" ||
-        (this as any).__geoEvalUseIsolatedPglite === true;
-    const pgliteTarget = evalIso ? ("eval" as const) : ("default" as const);
-    const pgExec = { pgliteTarget };
     (this as any).__geoEvalExecutedSqlFirst = undefined;
     (this as any).__geoEvalExecutedSqlFinal = undefined;
     (this as any).__geoEvalSanitizerFixes = undefined;
@@ -1135,9 +1130,7 @@ export async function queryGeoSpatialWithSQLQuery(
     if (skipImport) {
         try {
             const cntRows = await runPostgisQuery(
-                `SELECT COUNT(*)::int AS c FROM features`,
-                undefined,
-                pgExec
+                `SELECT COUNT(*)::int AS c FROM features`
             );
             insertedFeatureCount = cntRows[0]?.c ?? 0;
         } catch (e) {
@@ -1154,12 +1147,9 @@ export async function queryGeoSpatialWithSQLQuery(
                 targetUrl,
                 dist.format,
                 dist.title,
-                {
-                    ...(typeof maxFeat === "number"
-                        ? { maxFeatures: maxFeat }
-                        : {}),
-                    pgliteTarget
-                }
+                typeof maxFeat === "number"
+                    ? { maxFeatures: maxFeat }
+                    : undefined
             );
             insertedFeatureCount = importResult.inserted;
             if (importResult.truncated) {
@@ -1181,7 +1171,7 @@ export async function queryGeoSpatialWithSQLQuery(
     const propKeys =
         propKeysFromProfile?.length && propKeysFromProfile.length > 0
             ? propKeysFromProfile
-            : await sampleGeoPropertyKeys(pgExec);
+            : await sampleGeoPropertyKeys();
 
     const coverageAndReference = resolveGeoReferenceForQuery(this, propKeys);
     const profileValues = collectProfileAttributeValues(
@@ -1545,11 +1535,7 @@ export async function queryGeoSpatialWithSQLQuery(
                 }
                 // Preflight parse to catch syntax errors before first execution.
                 try {
-                    await runPostgisQuery(
-                        `EXPLAIN ${sqlToRun}`,
-                        undefined,
-                        pgExec
-                    );
+                    await runPostgisQuery(`EXPLAIN ${sqlToRun}`);
                 } catch (e) {
                     failureFromPreflight = true;
                     throw e;
@@ -1560,7 +1546,7 @@ export async function queryGeoSpatialWithSQLQuery(
                 this,
                 formatGeoSqlLog(`Executing GeoSQL attempt ${attempt}`, sqlToRun)
             );
-            records = await runPostgisQuery(sqlToRun, undefined, pgExec);
+            records = await runPostgisQuery(sqlToRun);
             (this as any).__geoEvalExecutedSqlFinal = sqlToRun;
             if (this.geoEvalCaptureExecutedSql) {
                 this.evalCapturedExecutedSql = sqlToRun;

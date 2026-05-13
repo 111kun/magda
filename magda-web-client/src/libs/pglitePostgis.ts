@@ -29,8 +29,6 @@ export type ImportSpatialResult = {
 };
 
 let pgPromise: Promise<PGliteType> | null = null;
-/** Isolated DB for geosql browser eval — do not share with chat `magda-pglite`. */
-let pgEvalPromise: Promise<PGliteType> | null = null;
 
 function normalizeImportLimit(maxFeatures?: number): number {
     if (
@@ -140,139 +138,11 @@ export async function getPGlitePostgis(): Promise<PGliteType> {
     return await pgPromise;
 }
 
-async function createEvalInstance(): Promise<PGliteType> {
-    const [{ PGlite }, { postgis }] = await Promise.all([
-        import(
-            /* webpackChunkName: "pglite" */ "@electric-sql/pglite"
-        ) as Promise<typeof import("@electric-sql/pglite")>,
-        import(
-            /* webpackChunkName: "pglite-postgis" */ "@electric-sql/pglite-postgis"
-        ) as Promise<typeof import("@electric-sql/pglite-postgis")>
-    ]);
-
-    const pg = await PGlite.create({
-        dataDir: "idb://magda-geosql-eval",
-        relaxedDurability: true,
-        extensions: { postgis }
-    });
-    await pg.exec(`
-        CREATE EXTENSION IF NOT EXISTS postgis;
-        CREATE TABLE IF NOT EXISTS features (
-            id SERIAL PRIMARY KEY,
-            properties JSONB,
-            geom geometry
-        );
-        CREATE INDEX IF NOT EXISTS features_gix ON features USING GIST (geom);
-    `);
-    return pg;
-}
-
-export async function getPGlitePostgisEval(): Promise<PGliteType> {
-    if (!pgEvalPromise) pgEvalPromise = createEvalInstance();
-    return await pgEvalPromise;
-}
-
-export async function runPostgisQueryEval(
+export async function runPostgisQuery(
     query: string,
     params?: any[]
 ): Promise<Record<string, any>[]> {
-    const pg = await getPGlitePostgisEval();
-    const stmt = query.trim();
-    const looksMulti =
-        stmt.split(";").filter((s: string) => s.trim()).length > 1;
-    if (looksMulti) {
-        const ret = await pg.exec(stmt);
-        const lastWithRows = [...ret]
-            .reverse()
-            .find((r: any) => r?.rows?.length);
-        if (lastWithRows?.rows) return lastWithRows.rows as any;
-        return ret.map((r: any, idx: number) => ({
-            statement: idx + 1,
-            affectedRows:
-                typeof r?.affectedRows === "number" ? r.affectedRows : null
-        }));
-    }
-    const result = await pg.query(stmt, params);
-    if (result?.rows) return result.rows as any;
-    return [{ "Query result:": "No result returned." }];
-}
-
-/**
- * Same insert path as importSpatialFromDistribution, but against eval PGlite
- * and an in-memory FeatureCollection (e.g. from shpjs).
- */
-export async function importGeoJsonFeatureCollectionForEval(
-    fc: GeoFeatureCollection,
-    options?: { maxFeatures?: number }
-): Promise<ImportSpatialResult> {
-    const pg = await getPGlitePostgisEval();
-    const maxFeatures = normalizeImportLimit(options?.maxFeatures);
-    const validFeatures = fc.features.filter(
-        (f): f is GeoFeature => !!f?.geometry
-    );
-    const importFeatures = validFeatures.slice(0, maxFeatures);
-
-    await pg.exec("TRUNCATE features;");
-    let inserted = 0;
-    for (const f of importFeatures) {
-        await pg.query(
-            `WITH g AS (
-                SELECT ST_GeomFromGeoJSON($2) AS raw_geom
-             )
-             INSERT INTO features (properties, geom)
-             SELECT
-                $1::jsonb,
-                CASE
-                    WHEN raw_geom IS NULL THEN NULL
-                    WHEN
-                        (
-                            abs(ST_XMin(raw_geom)) > 180 OR
-                            abs(ST_XMax(raw_geom)) > 180 OR
-                            abs(ST_YMin(raw_geom)) > 90 OR
-                            abs(ST_YMax(raw_geom)) > 90
-                        )
-                        AND
-                        (
-                            abs(ST_XMin(raw_geom)) > 1000 OR
-                            abs(ST_XMax(raw_geom)) > 1000 OR
-                            abs(ST_YMin(raw_geom)) > 1000 OR
-                            abs(ST_YMax(raw_geom)) > 1000
-                        )
-                    THEN ST_Transform(ST_SetSRID(raw_geom, 3857), 4326)
-                    WHEN
-                        abs(ST_XMin(raw_geom)) <= 90 AND
-                        abs(ST_XMax(raw_geom)) <= 90 AND
-                        abs(ST_YMin(raw_geom)) <= 180 AND
-                        abs(ST_YMax(raw_geom)) <= 180
-                    THEN ST_SetSRID(ST_FlipCoordinates(raw_geom), 4326)
-                    ELSE ST_SetSRID(raw_geom, 4326)
-                END
-             FROM g;`,
-            [f.properties ?? null, JSON.stringify(f.geometry)]
-        );
-        inserted++;
-    }
-    const totalFeatures = validFeatures.length;
-    return {
-        inserted,
-        totalFeatures,
-        skippedFeatures: Math.max(totalFeatures - inserted, 0),
-        maxFeatures,
-        truncated: totalFeatures > inserted
-    };
-}
-
-export type PgliteQueryTarget = "default" | "eval";
-
-export async function runPostgisQuery(
-    query: string,
-    params?: any[],
-    execOptions?: { pgliteTarget?: PgliteQueryTarget }
-): Promise<Record<string, any>[]> {
-    const pg =
-        execOptions?.pgliteTarget === "eval"
-            ? await getPGlitePostgisEval()
-            : await getPGlitePostgis();
+    const pg = await getPGlitePostgis();
     const stmt = query.trim();
     const looksMulti =
         stmt.split(";").filter((s: string) => s.trim()).length > 1;
@@ -477,12 +347,9 @@ export async function importSpatialFromDistribution(
     targetUrl: string,
     format?: string,
     distributionTitle?: string,
-    options?: { maxFeatures?: number; pgliteTarget?: PgliteQueryTarget }
+    options?: { maxFeatures?: number }
 ): Promise<ImportSpatialResult> {
-    const pg =
-        options?.pgliteTarget === "eval"
-            ? await getPGlitePostgisEval()
-            : await getPGlitePostgis();
+    const pg = await getPGlitePostgis();
     const fc = await toFeatureCollectionFromDistribution(
         targetUrl,
         format,
