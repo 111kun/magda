@@ -661,6 +661,13 @@ const GeoSqlEvalRunnerPage: React.FC = () => {
                         notes: `AgentChain path; fake URL→/eval-data; gold_ok=${goldResult.ok}, first_ok=${firstResult.ok}, final_ok=${finalResult.ok}; capture_ok=${prodOk}`
                     }
                 });
+
+                if (i < cases.length - 1) {
+                    appendLog(
+                        `[${datasetId}] GPU cooldown (3 s) before next case…`
+                    );
+                    await new Promise((r) => setTimeout(r, 3000));
+                }
             }
 
             const built: Report = {

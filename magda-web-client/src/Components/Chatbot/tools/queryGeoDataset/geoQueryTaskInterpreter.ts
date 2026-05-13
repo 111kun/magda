@@ -877,6 +877,7 @@ export async function resolveGeoQueryTaskSpec(input: {
     }
     try {
         const engine = await input.getEngine();
+        await engine.resetChat();
         const deterministicJson = {
             target_pattern: baseSpec.plan.target_pattern,
             bindings_preview: baseSpec.plan.bindings,
@@ -920,6 +921,11 @@ export async function resolveGeoQueryTaskSpec(input: {
                 { role: "user", content: user }
             ]
         });
+        if (reply?.usage) {
+            console.log(
+                `[GeoTaskInterpreter] LLM usage: prompt=${reply.usage.prompt_tokens} completion=${reply.usage.completion_tokens} total=${reply.usage.total_tokens}`
+            );
+        }
         const raw = reply?.choices?.[0]?.message?.content?.trim() || "";
         const patch = parseLlmPlanPatch(raw);
         if (!patch) {

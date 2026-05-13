@@ -404,6 +404,9 @@ async function generateGeoDatasetIntro(
     }
     try {
         const engine = await input.model.getEngine();
+        console.log("[generateGeoDatasetIntro] resetChat before intro LLM…");
+        await engine.resetChat();
+        console.log("[generateGeoDatasetIntro] resetChat done.");
         const reply = await engine.chat.completions.create({
             stream: false,
             messages: [
@@ -422,6 +425,12 @@ async function generateGeoDatasetIntro(
                 }
             ]
         });
+        if (reply?.usage) {
+            pushGeoRunLog(
+                input,
+                `Intro LLM usage: prompt=${reply.usage.prompt_tokens} completion=${reply.usage.completion_tokens} total=${reply.usage.total_tokens} tokens.`
+            );
+        }
         const text = reply?.choices?.[0]?.message?.content?.trim();
         return text || null;
     } catch {
@@ -436,6 +445,9 @@ export async function planGeoSqlQuery(
     fileDescItems?: string[]
 ): Promise<GeoSqlPlan> {
     const engine = await this.model.getEngine();
+    console.log("[planGeoSqlQuery] calling engine.resetChat() before planner…");
+    await engine.resetChat();
+    console.log("[planGeoSqlQuery] engine.resetChat() completed.");
     const schemaContextLabel =
         "Dataset information (authoritative schema + sample values for SQL key/value grounding)";
     const distList = dists
@@ -658,6 +670,13 @@ export async function planGeoSqlQuery(
             type: "not_applicable" as const,
             reason: `Planner LLM error: ${String(e)}`
         };
+    }
+    const usage = reply?.usage;
+    if (usage) {
+        pushGeoRunLog(
+            this,
+            `Planner LLM usage: prompt=${usage.prompt_tokens} completion=${usage.completion_tokens} total=${usage.total_tokens} tokens.`
+        );
     }
     const raw = reply?.choices?.[0]?.message?.content?.trim();
     if (!raw) {

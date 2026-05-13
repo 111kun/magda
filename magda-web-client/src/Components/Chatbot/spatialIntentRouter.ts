@@ -411,6 +411,7 @@ async function parseByLocalLlm(
     const sampleValues = collectSpatialSampleValues(input);
     try {
         const engine = await input.model.getEngine();
+        await engine.resetChat();
         const scopeBlock = input.spatialCoverage?.scopeHintForLlm
             ? `${input.spatialCoverage.scopeHintForLlm}\n\n`
             : "";
@@ -440,6 +441,11 @@ async function parseByLocalLlm(
                 }
             ]
         });
+        if (reply?.usage) {
+            console.log(
+                `[SpatialIntentRouter] LLM usage: prompt=${reply.usage.prompt_tokens} completion=${reply.usage.completion_tokens} total=${reply.usage.total_tokens}`
+            );
+        }
         const raw = reply?.choices?.[0]?.message?.content || "";
         const parsed = parseGeoQueryParserJson(raw);
         if (

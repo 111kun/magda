@@ -328,6 +328,21 @@ class AgentChain {
                     }
                 }
             } finally {
+                try {
+                    console.log(
+                        "[AgentChain.stream] finally: calling resetChat…"
+                    );
+                    const eng = await this.model.getEngine();
+                    await eng.resetChat();
+                    console.log(
+                        "[AgentChain.stream] finally: resetChat completed."
+                    );
+                } catch (rcErr) {
+                    console.warn(
+                        "[AgentChain.stream] finally: resetChat failed:",
+                        rcErr
+                    );
+                }
                 finishQueue();
             }
         })();
