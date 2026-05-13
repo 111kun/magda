@@ -17,7 +17,7 @@ export type ColumnBindingRole = "FILTER" | "GROUP_BY" | "SELECT" | "ORDER_BY";
 
 /**
  * Every business attribute must use JSONB access on `features.properties`.
- * physical_key MUST be one of the schema `existing_keys` passed in.
+ * physical_key MUST be one of the keys in `properties_schema.keys`.
  */
 export type SchemaColumnBinding = {
     logical_term?: string;
@@ -497,7 +497,7 @@ function buildLogicTraceLines(
 
 /**
  * Deterministic Schema-Linked Execution Plan from scope + schema keys.
- * Critical: physical_key values only come from `propertyKeys` (existing_keys).
+ * Critical: physical_key values only come from `propertyKeys` (schema keys).
  */
 export function buildSchemaLinkedExecutionPlan(input: {
     scope: GeoQueryScope;

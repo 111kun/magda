@@ -242,7 +242,10 @@ class AgentChain {
 
     async stream(
         question: string,
-        streamOpts?: { geoEvalCaptureExecutedSql?: boolean }
+        streamOpts?: {
+            geoEvalCaptureExecutedSql?: boolean;
+            warmupOnly?: boolean;
+        }
     ): Promise<AsyncIterable<ChatEventMessage>> {
         const queue = new AsyncQueue<ChatEventMessage>();
         const input: ChainInput = {
@@ -255,7 +258,8 @@ class AgentChain {
             dataset: this.dataset,
             distribution: this.distribution,
             keyContextData: this.keyContextData,
-            geoEvalCaptureExecutedSql: streamOpts?.geoEvalCaptureExecutedSql
+            geoEvalCaptureExecutedSql: streamOpts?.geoEvalCaptureExecutedSql,
+            warmupOnly: streamOpts?.warmupOnly
         };
         if (streamOpts?.geoEvalCaptureExecutedSql) {
             (input as any).__geoEvalSkipImport = true;
@@ -366,6 +370,16 @@ class AgentChain {
                         await enrichSpatialProfile(input, profile);
                         input.keyContextData.datasetProfileUpdatedAt = Date.now();
                     }
+                }
+
+                if (input.warmupOnly) {
+                    queue.push(
+                        createChatEventRunLogMsg(
+                            "Warmup complete (profile enrichment only; LLM skipped).",
+                            "System Logs"
+                        )
+                    );
+                    return;
                 }
 
                 const routeDecision = await decideChatRoute(input);

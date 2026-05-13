@@ -698,7 +698,7 @@ export async function repairGeoSqlWithModel(
         "- Only id, properties, and geom are top-level columns; all dataset attributes must be accessed through properties JSONB\n" +
         "- If the user asks for rows nearest to a dataset feature identified by an existing column/key and value, do not use placeName-style geocoding; use a CTE/self-join against features as the reference geometry\n" +
         "- JSONB keys are case-sensitive\n" +
-        "- MUST use only keys from YAML schema_binding.properties_schema.existing_keys (exact casing); do not invent key names\n" +
+        "- MUST use only keys from properties_schema.keys map (exact casing); do not invent key names\n" +
         "- If the requested natural-language field is not an exact key (e.g. user says name), map it to the closest existing key from sampled keys (e.g. asset_name) instead of inventing columns\n" +
         "- If no suitable existing field matches the request, return a query intent that clearly indicates no suitable field instead of guessing\n" +
         "- Align filters/selection with dataset meaning from metadata (title/description/tags/themes/distribution description)\n" +

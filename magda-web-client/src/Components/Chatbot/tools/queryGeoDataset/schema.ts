@@ -31,20 +31,17 @@ export type SampledPropertyField = {
     recommendedAccess: "->" | "->>";
 };
 
+/** Compact per-key schema entry for LLM prompt (Map value). */
+export type PropertyFieldEntry = {
+    type: string;
+    examples?: string[];
+    distinct?: number;
+};
+
 export type PropertySchemaBinding =
     | {
           status: "ok";
-          existing_keys: string[];
-          fields: {
-              key: string;
-              inferred_type: SampledPropertyField["inferredType"];
-              sample_value: string;
-              recommended_accessor: string;
-              enum_values?: string[];
-              sample_values?: string[];
-              approx_distinct?: number;
-              enum_note?: string;
-          }[];
+          keys: Record<string, PropertyFieldEntry>;
       }
     | { status: "empty" | "sampling_failed"; message: string };
 
@@ -246,16 +243,15 @@ export function formatPropertySchemaForDescription(
             message: "No sampled keys found in properties."
         };
     }
-    return {
-        status: "ok",
-        existing_keys: fields.map((x) => x.key),
-        fields: fields.map((x) => ({
-            key: x.key,
-            inferred_type: x.inferredType,
-            sample_value: x.sampleValue,
-            recommended_accessor: `properties${x.recommendedAccess}'${x.key}'`
-        }))
-    };
+    const keys: Record<string, PropertyFieldEntry> = {};
+    for (const f of fields) {
+        const entry: PropertyFieldEntry = { type: f.inferredType };
+        if (f.sampleValue) {
+            entry.examples = [f.sampleValue];
+        }
+        keys[f.key] = entry;
+    }
+    return { status: "ok", keys };
 }
 
 export async function sampleGeoDatasetOverview(

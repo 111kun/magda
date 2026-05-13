@@ -13,6 +13,7 @@ import {
 import { getDistributionUrl } from "./distribution";
 import {
     PropertySchemaBinding,
+    PropertyFieldEntry,
     formatPropertySchemaForDescription,
     getGeoDistributionSampleHint,
     sampleGeoPropertySchema
@@ -23,28 +24,13 @@ type BuildGeoFileSampleOptions = {
     skipSpatialImportForSample?: boolean;
 };
 
-type GeometryProfile = {
-    status: "ok" | "sampling_failed";
-    families: string[];
-    sampled_feature_count: number;
-    message?: string;
-};
-
 type GeoFileProfile = {
     id: number;
     title: string;
     format: string;
-    schema_binding: {
-        note: string;
-        features_virtual_table: {
-            id: string;
-            properties: string;
-            geom: string;
-        };
-        properties_schema: PropertySchemaBinding;
-        geometry_profile: GeometryProfile;
-    };
-    sample_row_hint?: string;
+    geom: string;
+    feature_count?: number;
+    properties_schema: PropertySchemaBinding;
     sample?: string;
 };
 
@@ -106,16 +92,12 @@ async function buildGeoFileProfiles(
                           sampleOptions?.skipSpatialImportForSample
                   })
                 : null;
-        let sampledPropertySchema: PropertySchemaBinding = {
+        let propSchema: PropertySchemaBinding = {
             status: "sampling_failed",
-            message: "Property schema not sampled for this file."
+            message: "Not sampled."
         };
-        let geometryProfile: GeometryProfile = {
-            status: "sampling_failed",
-            families: [],
-            sampled_feature_count: 0,
-            message: "Geometry profile not sampled for this file."
-        };
+        let geomLabel = "unknown";
+        let featureCount = 0;
         if (i < samplePreviewLimit) {
             try {
                 await importSpatialFromDistribution(
@@ -125,9 +107,7 @@ async function buildGeoFileProfiles(
                 );
                 const geomRows = await runPostgisQuery(
                     `SELECT GeometryType(geom) AS geom_type
-                     FROM features
-                     WHERE geom IS NOT NULL
-                     LIMIT 50`
+                     FROM features WHERE geom IS NOT NULL LIMIT 50`
                 );
                 const families = new Set<string>();
                 for (const row of geomRows || []) {
@@ -135,54 +115,29 @@ async function buildGeoFileProfiles(
                         normalizeGeomFamily(String(row?.geom_type || ""))
                     );
                 }
-                geometryProfile = {
-                    status: "ok",
-                    families: [...families].sort(),
-                    sampled_feature_count: geomRows?.length || 0
-                };
-                const propertySchema = await sampleGeoPropertySchema();
-                sampledPropertySchema = formatPropertySchemaForDescription(
-                    propertySchema
+                geomLabel = [...families].sort().join("/") || "unknown";
+                featureCount = geomRows?.length || 0;
+                propSchema = formatPropertySchemaForDescription(
+                    await sampleGeoPropertySchema()
                 );
             } catch {
-                sampledPropertySchema = {
-                    status: "sampling_failed",
-                    message: "Property schema sampling failed for this file."
-                };
-                geometryProfile = {
-                    status: "sampling_failed",
-                    families: [],
-                    sampled_feature_count: 0,
-                    message: "Geometry profile sampling failed for this file."
-                };
+                // leave defaults
             }
         }
         profiles.push({
             id,
             title: dist.title,
             format: dist.format,
-            schema_binding: {
-                note:
-                    "Select this id as distributionIndex before running GeoSQL.",
-                features_virtual_table: {
-                    id: "serial",
-                    properties: "jsonb",
-                    geom: "geometry (usually SRID 4326)"
-                },
-                properties_schema: sampledPropertySchema,
-                geometry_profile: geometryProfile
-            },
-            ...(sampleHint
-                ? {
-                      sample_row_hint:
-                          "Use this real sample row to infer SQL field access and geometry handling.",
-                      sample: sampleHint
-                  }
-                : {})
+            geom: geomLabel,
+            feature_count: featureCount || undefined,
+            properties_schema: propSchema,
+            ...(sampleHint ? { sample: sampleHint.slice(0, 200) } : {})
         });
     }
     return profiles;
 }
+
+const MAX_EXAMPLES = 5;
 
 async function buildGeoFileProfilesFromSpatialProfile(
     distItems: { idx: number; dist: ParsedDistribution }[],
@@ -202,36 +157,29 @@ async function buildGeoFileProfilesFromSpatialProfile(
             .filter((value, index, array) => array.indexOf(value) === index);
         const keys = profile?.propertyKeys || [];
         const valueSamples = profile?.valueSamples || {};
-        const propertiesSchema: PropertySchemaBinding = keys.length
+        const propSchema: PropertySchemaBinding = keys.length
             ? {
                   status: "ok",
-                  existing_keys: keys,
-                  fields: keys.map((key) => ({
-                      key,
-                      inferred_type: "mixed",
-                      sample_value: "",
-                      recommended_accessor: `properties->>'${key}'`,
-                      ...(valueSamples[key]
-                          ? valueSamples[key].mode === "full"
-                              ? {
-                                    enum_values: valueSamples[key].values,
-                                    enum_note:
-                                        "Low-cardinality field; full enum values sampled from dataset profile."
-                                }
-                              : {
-                                    sample_values: valueSamples[key].values,
-                                    approx_distinct:
-                                        valueSamples[key].approxDistinct,
-                                    enum_note:
-                                        "High-cardinality field; representative top values sampled from dataset profile."
-                                }
-                          : {})
-                  }))
+                  keys: Object.fromEntries(
+                      keys.map((key) => {
+                          const entry: PropertyFieldEntry = { type: "mixed" };
+                          const vs = valueSamples[key];
+                          if (vs) {
+                              entry.examples = vs.values.slice(0, MAX_EXAMPLES);
+                              entry.distinct = vs.approxDistinct;
+                          }
+                          return [key, entry];
+                      })
+                  )
               }
             : {
                   status: "empty",
-                  message: "No profiled keys found in datasetProfile."
+                  message: "No profiled keys."
               };
+        const featureCount = (profile?.geometryTypes || []).reduce(
+            (acc, item) => acc + (item.count || 0),
+            0
+        );
         const sampleHint =
             i < 2
                 ? await getGeoDistributionSampleHint(dist, {
@@ -243,39 +191,10 @@ async function buildGeoFileProfilesFromSpatialProfile(
             id: idx,
             title: dist.title,
             format: dist.format,
-            schema_binding: {
-                note:
-                    "Select this id as distributionIndex before running GeoSQL.",
-                features_virtual_table: {
-                    id: "serial",
-                    properties: "jsonb",
-                    geom: "geometry (usually SRID 4326)"
-                },
-                properties_schema: propertiesSchema,
-                geometry_profile: {
-                    status:
-                        profile?.geometryTypes?.length || profile?.bboxWkt
-                            ? "ok"
-                            : "sampling_failed",
-                    families: geomFamilies.length ? geomFamilies : [],
-                    sampled_feature_count:
-                        (profile?.geometryTypes || []).reduce(
-                            (acc, item) => acc + (item.count || 0),
-                            0
-                        ) || 0,
-                    message:
-                        !profile || profile.status === "failed"
-                            ? "Geometry profile unavailable in datasetProfile."
-                            : undefined
-                }
-            },
-            ...(sampleHint
-                ? {
-                      sample_row_hint:
-                          "Use this real sample row to infer SQL field access and geometry handling.",
-                      sample: sampleHint
-                  }
-                : {})
+            geom: geomFamilies.join("/") || "unknown",
+            feature_count: featureCount || undefined,
+            properties_schema: propSchema,
+            ...(sampleHint ? { sample: sampleHint.slice(0, 200) } : {})
         });
     }
     return profiles;
@@ -290,16 +209,12 @@ function buildGeoDatasetIntroContextFromProfiles(
     }
     const previewProfiles = profiles.slice(0, 2);
     const lines = previewProfiles.map((profile) => {
-        const geomFamilies = profile.schema_binding.geometry_profile.families
-            .length
-            ? profile.schema_binding.geometry_profile.families.join(", ")
-            : "unknown";
-        const propSchema = profile.schema_binding.properties_schema;
+        const propSchema = profile.properties_schema;
         const fields =
             propSchema.status === "ok"
-                ? propSchema.existing_keys.slice(0, 12).join(", ")
+                ? Object.keys(propSchema.keys).slice(0, 12).join(", ")
                 : "n/a";
-        return `- [${profile.id}] ${profile.title}: geometry=${geomFamilies}; fields=${fields}`;
+        return `- [${profile.id}] ${profile.title}: geom=${profile.geom}; keys=${fields}`;
     });
     return [metadataBrief, "Spatial file summary:", lines.join("\n")]
         .filter((part) => !!part)
@@ -387,8 +302,7 @@ export function buildGeoSqlToolDescription(
         "- After import, data lives in virtual table `features(id serial, properties jsonb, geom geometry)`.\n" +
         "- `features` is the ONLY SQL table name available in the browser PostGIS database; never use dataset titles, distribution titles, filenames, or derived names as table names.\n" +
         "- `properties` keys are case-sensitive in JSONB; do not change key casing.\n" +
-        "- MUST use only keys listed in YAML `schema_binding.properties_schema.existing_keys`; do not invent or normalize key names.\n" +
-        "- Use the provided `properties_schema` and sampled key list to bind SQL fields exactly.\n" +
+        "- MUST use only keys from `properties_schema.keys` map; do not invent or normalize key names.\n" +
         "Execution Rules:\n" +
         "For place-distance queries, provide `placeName` and use token `__REF_POINT__` in SQL. " +
         "The tool resolves place coordinates by searching current dataset first; if not found, it falls back to OpenStreetMap Nominatim.\n" +

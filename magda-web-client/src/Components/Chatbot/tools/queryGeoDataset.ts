@@ -343,7 +343,7 @@ export async function planGeoSqlQuery(
         "",
         "## Database Schema (CRITICAL)",
         "- Table name: `features` only. The browser runtime loads the chosen spatial distribution into this table; never use dataset title, distribution title, file names, or invented table names (e.g. no `Manningham_Street_Trees`).",
-        `- Source of truth for schema/keys/values: the \`${schemaContextLabel}\` block in the USER message. Assume \`features.properties\` follows that block's existing_keys and sample rows; do not invent keys outside it.`,
+        `- Source of truth for schema/keys/values: the \`${schemaContextLabel}\` block in the USER message. The \`properties_schema.keys\` map lists every valid key; access via \`properties->>'key'\`. Do not invent keys outside it.`,
         "- Columns:",
         "  - `id`: unique row identifier.",
         "  - `geom`: geometry in SRID 4326.",
@@ -361,8 +361,8 @@ export async function planGeoSqlQuery(
         "6. **Reference placeholder**: when Parser reference context indicates an external place, use the literal token `__REF_POINT__` in SQL as a ready-made geometry in SRID 4326. Use it directly inside spatial functions (e.g. `ST_DWithin`, `ST_Distance`, `ST_Intersects`). Do not wrap it in `ST_MakePoint`, do not read `.__REF_POINT__.lon` / `.lat`, and do not substitute prose.",
         "",
         "## Planning Rules",
-        '1. **No guessing keys**: If a JSONB key is not present in `schema_binding.properties_schema.existing_keys` (see YAML), do not invent it. If the user uses a vague label (e.g. "name"), map to the closest existing key using metadata/sample evidence.',
-        "2. **Self-join / CTE for in-dataset anchors**: When the reference is an existing feature identified by column/key + value (e.g. a street name, id, species), do **not** set `placeName` or rely on `__REF_POINT__`. Use a CTE, e.g. `WITH ref AS (SELECT geom FROM features WHERE properties->>'street' = 'King St' LIMIT 1) SELECT ... FROM features, ref WHERE ST_DWithin(features.geom, ref.geom, ...)` (adjust keys/values to real existing_keys).",
+        '1. **No guessing keys**: If a JSONB key is not present in `properties_schema.keys` (see YAML), do not invent it. If the user uses a vague label (e.g. "name"), map to the closest existing key using metadata/sample evidence.',
+        "2. **Self-join / CTE for in-dataset anchors**: When the reference is an existing feature identified by column/key + value (e.g. a street name, id, species), do **not** set `placeName` or rely on `__REF_POINT__`. Use a CTE, e.g. `WITH ref AS (SELECT geom FROM features WHERE properties->>'street' = 'King St' LIMIT 1) SELECT ... FROM features, ref WHERE ST_DWithin(features.geom, ref.geom, ...)` (adjust keys/values to real keys).",
         "3. **External place only**: If Parser reference context says external `place=<text>`, set `placeName` to that exact text and use `__REF_POINT__` in `sqlQuery` wherever that external location is needed.",
         "4. **Single executable statement**: `sqlQuery` must be one `SELECT` or `WITH ... SELECT` only; no DDL/DML; no multiple statements; no markdown, apologies, comments outside SQL, or JSON around the SQL.",
         "5. **Compact SELECT**: Prefer `id`, a few `properties->>'...'` columns needed to answer the question, computed metrics, and `ST_AsText(geom) AS geom_wkt`. Avoid `SELECT *`, raw `geom` binary, or entire `properties` unless the user explicitly asks.",
@@ -454,23 +454,53 @@ export async function planGeoSqlQuery(
         `${schemaContextLabel}:\n${
             fileDescItems?.length ? fileDescItems.join("\n---\n") : "N/A"
         }`;
+    const systemTokenEst = Math.ceil(plannerSystemInstruction.length / 3.5);
+    const userTokenEst = Math.ceil(plannerUserPrompt.length / 3.5);
+    const totalTokenEst = systemTokenEst + userTokenEst;
     pushGeoRunLog(
         this,
-        "Calling WebLLM for GeoSQL JSON plan (non-streaming; may take minutes in browser)…"
+        `Calling WebLLM for GeoSQL JSON plan (non-streaming; ~${totalTokenEst} prompt tokens estimated)…`
     );
-    const reply = await engine.chat.completions.create({
-        stream: false,
-        messages: [
-            {
-                role: "system",
-                content: plannerSystemInstruction
-            },
-            {
-                role: "user",
-                content: plannerUserPrompt
-            }
-        ]
-    });
+    const PLANNER_TIMEOUT_MS = 5 * 60 * 1000;
+    let reply: Awaited<
+        ReturnType<typeof engine.chat.completions.create>
+    > | null = null;
+    try {
+        reply = await Promise.race([
+            engine.chat.completions.create({
+                stream: false,
+                messages: [
+                    {
+                        role: "system",
+                        content: plannerSystemInstruction
+                    },
+                    {
+                        role: "user",
+                        content: plannerUserPrompt
+                    }
+                ]
+            }),
+            new Promise<never>((_, reject) =>
+                setTimeout(
+                    () =>
+                        reject(
+                            new Error(
+                                `WebLLM planner timed out after ${
+                                    PLANNER_TIMEOUT_MS / 1000
+                                }s (prompt ~${totalTokenEst} tokens).`
+                            )
+                        ),
+                    PLANNER_TIMEOUT_MS
+                )
+            )
+        ]);
+    } catch (e) {
+        pushGeoRunLog(this, `Planner LLM call failed: ${String(e)}`);
+        return {
+            type: "not_applicable" as const,
+            reason: `Planner LLM error: ${String(e)}`
+        };
+    }
     const raw = reply?.choices?.[0]?.message?.content?.trim();
     if (!raw) {
         return {

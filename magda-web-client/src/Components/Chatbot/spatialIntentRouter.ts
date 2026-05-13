@@ -68,7 +68,7 @@ export function buildSpatialCoverageHint(
         "DATASET SCOPE (words from title/description/tags/themes — catalogue context, not a map pin by themselves):\n" +
         `${scopeTokens.join(", ")}\n` +
         'If the user only uses these as a council/region/subject filter (no street, building, POI, coordinates, or explicit distance-to-a-point), prefer intent "non-spatial" and reference_type "none".\n' +
-        'If they say "near / within / closest" to a named POI or address, that named target is usually an EXTERNAL anchor unless it matches an attribute filter on existing_keys.';
+        'If they say "near / within / closest" to a named POI or address, that named target is usually an EXTERNAL anchor unless it matches an attribute filter on a known schema key.';
 
     return { scopeTokens, scopeHintForLlm };
 }
@@ -380,7 +380,7 @@ const SPATIAL_CLASSIFIER_SYSTEM = [
     "## Task",
     '1. Classify intent: "spatial" (should query spatial DB / PostGIS path) vs "non-spatial" (pure metadata/help/greeting/simple tabular stats only).',
     "2. Pick a reference anchor:",
-    '   - "internal": a row in THIS dataset (existing_keys + value, e.g. street = King).',
+    '   - "internal": a row in THIS dataset (schema key + value, e.g. street = King).',
     '   - "external": a real-world place OUTSIDE the attribute table (e.g. a library, 120 Collins St) used for distance / nearest.',
     '   - "none": no anchor.',
     "",
@@ -389,13 +389,13 @@ const SPATIAL_CLASSIFIER_SYSTEM = [
     "- Use non-spatial ONLY for clear pure metadata/help/greeting requests, or explicit non-geometry aggregate requests that can be answered without spatial DB.",
     "- If the question has near / closest / within [distance] / around / 附近 / 最近 / 距离, or asks where/location/distribution on map: intent = spatial.",
     "- If words match ONLY the DATASET SCOPE block (catalogue region names), do NOT treat them as external geocode anchors; set reference = none (intent can still be spatial).",
-    "- If the anchor is a filter on an existing_keys column: reference = internal.",
+    "- If the anchor is a filter on a known schema key column: reference = internal.",
     "- If the anchor is a POI/address not in attributes: reference = external.",
     "",
     "## Output",
     "Return JSON only. No markdown, no prose outside JSON.",
     'Shape: {"intent":"spatial"|"non-spatial","confidence":0-1,"reference_type":"internal"|"external"|"none","extraction":{},"reason":"one short sentence"}',
-    'Use "internal" only if extraction is {"key":"<one of existing_keys>","value":"<string>"} exactly.',
+    'Use "internal" only if extraction is {"key":"<one of schema keys>","value":"<string>"} exactly.',
     'Use "external" only if extraction is {"place":"<string>"}.',
     'Prefer "spatial" or "non-spatial". Avoid "unknown"; if ambiguous, return "spatial" with medium confidence.',
     "",
@@ -417,7 +417,7 @@ async function parseByLocalLlm(
         const userBody =
             `${scopeBlock}` +
             `Question:\n${input.question}\n\n` +
-            `existing_keys (use for internal only):\n${
+            `schema_keys (use for internal only):\n${
                 propertyKeys.length
                     ? propertyKeys.slice(0, 40).join(", ")
                     : "N/A"

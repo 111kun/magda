@@ -516,9 +516,12 @@ const GeoSqlEvalRunnerPage: React.FC = () => {
             appendLog(
                 `[${datasetId}] Warmup: enrichSpatialProfile (production import + profile)…`
             );
-            await drainChainStream(await agentChain.stream("."), {
-                onRunLog: (m) => appendLog(`[${datasetId}] warmup: ${m}`)
-            });
+            await drainChainStream(
+                await agentChain.stream(".", { warmupOnly: true }),
+                {
+                    onRunLog: (m) => appendLog(`[${datasetId}] warmup: ${m}`)
+                }
+            );
             appendLog(`[${datasetId}] Applying gold-sql compat VIEW…`);
             await applyGoldSqlCompatView(datasetMeta.table);
 
