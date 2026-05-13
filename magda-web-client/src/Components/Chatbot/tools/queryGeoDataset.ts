@@ -291,6 +291,98 @@ function getCountContractViolation(
     return null;
 }
 
+const SCHEMA_KEY_BUDGET = 15;
+
+function rankPropertyKeysForQuestion(
+    allKeys: string[],
+    question: string,
+    boundFilters: { key: string }[]
+): string[] {
+    if (allKeys.length <= SCHEMA_KEY_BUDGET) {
+        return allKeys;
+    }
+    const qTokens = question
+        .toLowerCase()
+        .split(/[^a-z0-9\u4e00-\u9fff]+/)
+        .filter((t) => t.length >= 2);
+
+    const scores = new Map<string, number>();
+    for (const key of allKeys) {
+        let score = 0;
+        const kLow = key.toLowerCase();
+        if (boundFilters.some((f) => f.key === key)) {
+            score += 100;
+        }
+        for (const tok of qTokens) {
+            if (kLow.includes(tok) || tok.includes(kLow)) {
+                score += 50;
+            }
+        }
+        if (
+            /^(name|id|type|status|class|suburb|city|state|region|category)$/i.test(
+                key
+            )
+        ) {
+            score += 10;
+        }
+        scores.set(key, score);
+    }
+    const sorted = [...allKeys].sort(
+        (a, b) => (scores.get(b) || 0) - (scores.get(a) || 0)
+    );
+    return sorted.slice(0, SCHEMA_KEY_BUDGET);
+}
+
+function pruneSchemaYaml(yaml: string, relevantKeys: Set<string>): string {
+    const lines = yaml.split("\n");
+    const result: string[] = [];
+    let insideKeys = false;
+    let currentKeyRelevant = true;
+    let skippedCount = 0;
+    for (const line of lines) {
+        if (/^\s+keys:\s*$/.test(line)) {
+            insideKeys = true;
+            result.push(line);
+            continue;
+        }
+        if (insideKeys) {
+            const keyMatch = line.match(/^\s{4}(\S+):\s*$/);
+            if (keyMatch) {
+                const keyName = keyMatch[1];
+                currentKeyRelevant = relevantKeys.has(keyName);
+                if (currentKeyRelevant) {
+                    result.push(line);
+                } else {
+                    skippedCount++;
+                }
+                continue;
+            }
+            const isSubField = /^\s{6}\S/.test(line);
+            if (isSubField) {
+                if (currentKeyRelevant) {
+                    result.push(line);
+                }
+                continue;
+            }
+            insideKeys = false;
+            currentKeyRelevant = true;
+            if (skippedCount > 0) {
+                result.push(
+                    `    # ...${skippedCount} more field(s) omitted for brevity`
+                );
+                skippedCount = 0;
+            }
+        }
+        result.push(line);
+    }
+    if (insideKeys && skippedCount > 0) {
+        result.push(
+            `    # ...${skippedCount} more field(s) omitted for brevity`
+        );
+    }
+    return result.join("\n");
+}
+
 function getPlannerPropertyKeys(input: ChainInput): string[] {
     const keys = new Set<string>();
     input.keyContextData?.datasetProfile?.spatial?.items?.forEach((item) => {
@@ -458,7 +550,26 @@ export async function planGeoSqlQuery(
         propertyKeys: plannerPropertyKeys,
         profileValues
     };
-    const outputGuidance = buildGeoSqlOutputGuidance(plannerPropertyKeys);
+    const relevantKeys = rankPropertyKeysForQuestion(
+        plannerPropertyKeys,
+        this.question,
+        scope.boundFilters
+    );
+    const relevantKeySet = new Set(relevantKeys);
+    const prunedFileDescItems = fileDescItems?.length
+        ? plannerPropertyKeys.length > SCHEMA_KEY_BUDGET
+            ? fileDescItems.map((yaml) => pruneSchemaYaml(yaml, relevantKeySet))
+            : fileDescItems
+        : undefined;
+    if (plannerPropertyKeys.length > SCHEMA_KEY_BUDGET) {
+        pushGeoRunLog(
+            this,
+            `Schema pruned: ${relevantKeys.length}/${
+                plannerPropertyKeys.length
+            } keys kept (${relevantKeys.join(", ")}).`
+        );
+    }
+    const outputGuidance = buildGeoSqlOutputGuidance(relevantKeys);
     const plannerUserPrompt =
         `User question:\n${this.question}\n\n` +
         `${formatTaskSpecForPlanner(taskSpec)}\n\n` +
@@ -497,7 +608,9 @@ export async function planGeoSqlQuery(
             metadataBrief || "N/A"
         }\n\n` +
         `${schemaContextLabel}:\n${
-            fileDescItems?.length ? fileDescItems.join("\n---\n") : "N/A"
+            prunedFileDescItems?.length
+                ? prunedFileDescItems.join("\n---\n")
+                : "N/A"
         }`;
     const systemTokenEst = Math.ceil(plannerSystemInstruction.length / 3.5);
     const userTokenEst = Math.ceil(plannerUserPrompt.length / 3.5);
