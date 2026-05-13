@@ -166,6 +166,16 @@ export async function enrichSpatialProfile(
 ): Promise<void> {
     const dists = listDistributions(input);
     const items: SpatialProfileItem[] = [];
+
+    type SampledProfile = {
+        geometryTypes: { type: string; count: number }[];
+        propertyKeys: string[];
+        sampleRows: Record<string, any>[];
+        valueSamples: Record<string, ValueSampleProfile>;
+        sampledFeatureCount: number;
+    };
+    let firstSuccessProfile: SampledProfile | null = null;
+
     for (const item of profile.spatial.items) {
         const dist = dists[item.distributionIndex];
         const targetUrl = dist ? getDistributionUrl(dist) : null;
@@ -173,14 +183,20 @@ export async function enrichSpatialProfile(
             items.push(item);
             continue;
         }
+
+        if (firstSuccessProfile) {
+            items.push({
+                ...item,
+                ...firstSuccessProfile
+            });
+            continue;
+        }
+
         try {
             await importSpatialFromDistribution(
                 targetUrl,
                 dist.format,
-                dist.title,
-                {
-                    maxFeatures: 500
-                }
+                dist.title
             );
             const geomTypesRows = await runPostgisQuery(
                 `SELECT GeometryType(geom) AS geom_type, COUNT(*)::int AS cnt
@@ -207,19 +223,23 @@ export async function enrichSpatialProfile(
                 .map((row) => String(row.key || "").trim())
                 .filter((key) => !!key);
             const valueSamples = await sampleValueProfilesForKeys(propertyKeys);
-            items.push({
-                ...item,
+            const cntRows = await runPostgisQuery(
+                `SELECT COUNT(*)::int AS c FROM features`
+            );
+            const sampledFeatureCount = cntRows?.[0]?.c ?? 0;
+            firstSuccessProfile = {
                 geometryTypes: (geomTypesRows || []).map((row) => ({
                     type: String(row.geom_type || ""),
                     count: Number(row.cnt || 0)
                 })),
                 propertyKeys,
-                sampledFeatureCount: 500,
                 sampleRows: (sampleRows || [])
                     .map((row) => row?.properties)
                     .filter((row) => !!row && typeof row === "object"),
-                valueSamples
-            });
+                valueSamples,
+                sampledFeatureCount
+            };
+            items.push({ ...item, ...firstSuccessProfile });
         } catch {
             items.push({
                 ...item,

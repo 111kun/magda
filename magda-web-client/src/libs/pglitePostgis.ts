@@ -30,6 +30,16 @@ export type ImportSpatialResult = {
 
 let pgPromise: Promise<PGliteType> | null = null;
 
+let loadedDistribution: {
+    url: string;
+    inserted: number;
+    maxFeatures: number;
+} | null = null;
+
+export function getLoadedDistribution() {
+    return loadedDistribution;
+}
+
 function normalizeImportLimit(maxFeatures?: number): number {
     if (
         typeof maxFeatures === "number" &&
@@ -405,6 +415,7 @@ export async function importSpatialFromDistribution(
         inserted++;
     }
     const totalFeatures = validFeatures.length;
+    loadedDistribution = { url: targetUrl, inserted, maxFeatures };
     return {
         inserted,
         totalFeatures,

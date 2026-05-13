@@ -21,7 +21,9 @@ import {
 } from "../Messaging";
 import { ChainInput, DatasetProfile } from "../commons";
 import {
+    DEFAULT_SPATIAL_IMPORT_FEATURE_LIMIT,
     formatImportSpatialResult,
+    getLoadedDistribution,
     importSpatialFromDistribution,
     runPostgisQuery
 } from "../../../libs/pglitePostgis";
@@ -56,6 +58,15 @@ import {
 } from "./queryGeoDataset/geoQueryTaskInterpreter";
 import type { GeoReference, SpatialIntentResult } from "../chatRouteRouter";
 
+type GeoSqlPlanContext = {
+    scope: GeoQueryScope;
+    reference: GeoReference;
+    referenceSource: string;
+    coverageMentions: string[];
+    propertyKeys: string[];
+    profileValues: ReturnType<typeof collectProfileAttributeValues>;
+};
+
 type GeoSqlPlan =
     | {
           type: "query";
@@ -63,6 +74,7 @@ type GeoSqlPlan =
           sqlQuery: string;
           placeName?: string;
           countrycodes?: string;
+          context: GeoSqlPlanContext;
       }
     | {
           type: "not_applicable";
@@ -394,6 +406,32 @@ export async function planGeoSqlQuery(
             this.keyContextData?.datasetProfile
         )
     });
+    const coverageAndReference = resolveGeoReferenceForQuery(
+        this,
+        plannerPropertyKeys
+    );
+    if (coverageAndReference.coverageMentions.length) {
+        pushGeoRunLog(
+            this,
+            `Detected dataset scope mentions: ${coverageAndReference.coverageMentions.join(
+                ", "
+            )}.`
+        );
+    }
+    if (scope.boundFilters.length) {
+        pushGeoRunLog(
+            this,
+            `Scope extractor bound filters: ${scope.boundFilters
+                .map((f) => `${f.key}=${f.value}`)
+                .join(", ")}.`
+        );
+    }
+    pushGeoRunLog(
+        this,
+        `Reference resolution: ${
+            coverageAndReference.source
+        }; ${formatGeoReferenceForPlanner(coverageAndReference.reference)}.`
+    );
     const taskSpec = await resolveGeoQueryTaskSpec({
         question: this.question,
         scope,
@@ -409,10 +447,17 @@ export async function planGeoSqlQuery(
             taskSpec.source
         }):\n${formatTaskSpecForPlanner(taskSpec)}`
     );
-    const coverageAndReference = resolveGeoReferenceForQuery(
-        this,
-        plannerPropertyKeys
+    const profileValues = collectProfileAttributeValues(
+        this.keyContextData?.datasetProfile
     );
+    const planContext: GeoSqlPlanContext = {
+        scope,
+        reference: coverageAndReference.reference,
+        referenceSource: coverageAndReference.source,
+        coverageMentions: coverageAndReference.coverageMentions,
+        propertyKeys: plannerPropertyKeys,
+        profileValues
+    };
     const outputGuidance = buildGeoSqlOutputGuidance(plannerPropertyKeys);
     const plannerUserPrompt =
         `User question:\n${this.question}\n\n` +
@@ -527,7 +572,8 @@ export async function planGeoSqlQuery(
                 countrycodes:
                     typeof (parsed as any).countrycodes === "string"
                         ? (parsed as any).countrycodes
-                        : undefined
+                        : undefined,
+                context: planContext
             };
         }
         if (
@@ -1072,7 +1118,8 @@ export async function queryGeoSpatialWithSQLQuery(
     distributionIndex: number,
     sqlQuery: string,
     placeName?: string,
-    countrycodes?: string
+    countrycodes?: string,
+    planCtx?: GeoSqlPlanContext
 ) {
     this.keyContextData.queryResult = undefined;
 
@@ -1138,26 +1185,32 @@ export async function queryGeoSpatialWithSQLQuery(
         return null;
     }
 
-    const skipImport = !!(this as any).__geoEvalSkipImport;
+    const evalSkipImport = !!(this as any).__geoEvalSkipImport;
+    const maxFeat = (this as any).__geoEvalMaxImportFeatures as
+        | number
+        | undefined;
+    const requiredLimit =
+        typeof maxFeat === "number"
+            ? maxFeat
+            : DEFAULT_SPATIAL_IMPORT_FEATURE_LIMIT;
+    const loaded = getLoadedDistribution();
+    const alreadyLoaded =
+        !evalSkipImport &&
+        loaded &&
+        loaded.inserted > 0 &&
+        loaded.maxFeatures >= requiredLimit;
 
     pushGeoUserMessage(
         this,
         `Preparing a spatial query for "${dist.title}"...`
     );
-    if (skipImport) {
+
+    let insertedFeatureCount: number | null = null;
+    if (evalSkipImport) {
         pushGeoRunLog(
             this,
             `Eval mode: using existing PostGIS \`features\` table (skip re-import for "${dist.title}").`
         );
-    } else {
-        pushGeoRunLog(
-            this,
-            `Importing spatial data for "${dist.title}" into PostGIS (PGlite).`
-        );
-    }
-
-    let insertedFeatureCount: number | null = null;
-    if (skipImport) {
         try {
             const cntRows = await runPostgisQuery(
                 `SELECT COUNT(*)::int AS c FROM features`
@@ -1170,9 +1223,18 @@ export async function queryGeoSpatialWithSQLQuery(
             );
             return null;
         }
+    } else if (alreadyLoaded) {
+        insertedFeatureCount = loaded.inserted;
+        pushGeoRunLog(
+            this,
+            `Reusing already-loaded "${dist.title}" (${insertedFeatureCount} features, imported during profile stage).`
+        );
     } else {
+        pushGeoRunLog(
+            this,
+            `Importing spatial data for "${dist.title}" into PostGIS (PGlite).`
+        );
         try {
-            const maxFeat = (this as any).__geoEvalMaxImportFeatures;
             const importResult = await importSpatialFromDistribution(
                 targetUrl,
                 dist.format,
@@ -1194,34 +1256,40 @@ export async function queryGeoSpatialWithSQLQuery(
         }
     }
 
-    const propKeysFromProfile =
-        typeof targetIdx === "number" && Number.isInteger(targetIdx)
-            ? profilePropertyKeysByIdx?.[targetIdx]
-            : undefined;
     const propKeys =
-        propKeysFromProfile?.length && propKeysFromProfile.length > 0
-            ? propKeysFromProfile
-            : await sampleGeoPropertyKeys();
+        planCtx?.propertyKeys ??
+        (await (async () => {
+            const fromProfile =
+                typeof targetIdx === "number" && Number.isInteger(targetIdx)
+                    ? profilePropertyKeysByIdx?.[targetIdx]
+                    : undefined;
+            return fromProfile?.length
+                ? fromProfile
+                : await sampleGeoPropertyKeys();
+        })());
 
-    const coverageAndReference = resolveGeoReferenceForQuery(this, propKeys);
-    const profileValues = collectProfileAttributeValues(
-        this.keyContextData?.datasetProfile
-    );
-    const scope = extractGeoQueryScope({
-        question: this.question,
-        propertyKeys: propKeys || [],
-        valueSamplesByKey: collectValueSamplesByKey(
-            this.keyContextData?.datasetProfile
-        ),
-        datasetScopeTerms: buildCoverageTerms(
-            this.keyContextData?.datasetProfile
-        )
-    });
+    const scope =
+        planCtx?.scope ??
+        extractGeoQueryScope({
+            question: this.question,
+            propertyKeys: propKeys || [],
+            valueSamplesByKey: collectValueSamplesByKey(
+                this.keyContextData?.datasetProfile
+            ),
+            datasetScopeTerms: buildCoverageTerms(
+                this.keyContextData?.datasetProfile
+            )
+        });
+    const parserReference =
+        planCtx?.reference ??
+        resolveGeoReferenceForQuery(this, propKeys).reference;
+    const profileValues =
+        planCtx?.profileValues ??
+        collectProfileAttributeValues(this.keyContextData?.datasetProfile);
     const taskSpecForContract =
         (this as ChainInput & { __geoQueryTaskSpec?: GeoQueryTaskSpec })
             .__geoQueryTaskSpec ??
         buildDeterministicTaskSpec(scope, this.question, propKeys || []);
-    const parserReference = coverageAndReference.reference;
     const parserPlaceName =
         parserReference.type === "external" && parserReference.place.trim()
             ? parserReference.place.trim()
@@ -1239,31 +1307,6 @@ export async function queryGeoSpatialWithSQLQuery(
             `Parser external reference "${parserPlaceName}" looks like dataset coverage context without explicit anchor intent; treating as non-reference.`
         );
     }
-    if (coverageAndReference.coverageMentions.length) {
-        pushGeoRunLog(
-            this,
-            `Detected dataset scope mentions: ${coverageAndReference.coverageMentions.join(
-                ", "
-            )}.`
-        );
-    }
-    if (scope.boundFilters.length) {
-        pushGeoRunLog(
-            this,
-            `Scope extractor bound filters: ${scope.boundFilters
-                .map((item) => `${item.key}=${item.value}`)
-                .join(", ")}.`
-        );
-    }
-    if (
-        parserPlaceName &&
-        isLikelyAttributeValueReference(parserPlaceName, profileValues)
-    ) {
-        pushGeoRunLog(
-            this,
-            `Parser place "${parserPlaceName}" matches sample attribute values; treating it as attribute context instead of external reference point.`
-        );
-    }
     const plannerPlaceName = sanitizeCandidatePlaceName(placeName);
     const shouldIgnorePlannerPlaceName =
         !!plannerPlaceName &&
@@ -1279,12 +1322,6 @@ export async function queryGeoSpatialWithSQLQuery(
             `Planner place "${plannerPlaceName}" looks like dataset scope/attribute value; ignoring external geocode reference.`
         );
     }
-    pushGeoRunLog(
-        this,
-        `Reference resolution source: ${
-            coverageAndReference.source
-        }; value: ${formatGeoReferenceForPlanner(parserReference)}.`
-    );
     if (parserPlaceName) {
         pushGeoRunLog(
             this,
@@ -1806,7 +1843,8 @@ export async function createQueryGeoDatasetTool(
                 plan.distributionIndex,
                 plan.sqlQuery,
                 plan.placeName,
-                plan.countrycodes
+                plan.countrycodes,
+                plan.context
             );
             if (typeof value === "undefined" || value === null) {
                 return;
