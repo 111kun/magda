@@ -536,11 +536,17 @@ function hasDatasetDescriptionIntent(question: string): boolean {
     if (!text) {
         return false;
     }
+    // Catalogue / schema help only — not attribute filters ("house field equals …").
     return (
-        /(当前数据集|这个数据集|数据集说明|字段|列名|样例|示例数据|schema|column|columns|field|fields)/.test(
+        /(当前数据集|这个数据集|数据集说明|字段说明|列名|样例|示例数据)/.test(
             text
         ) ||
-        /\b(dataset|metadata|describe|description|sample rows)\b/.test(text)
+        /\b(schema|column names?|sample rows?|data dictionary|field list)\b/.test(
+            text
+        ) ||
+        /\b(describe|description of)\s+(?:this|the)\s+dataset\b/.test(text) ||
+        /\bwhat\s+(?:columns?|fields?)\s+(?:does|are)\b/.test(text) ||
+        /\b(dataset metadata|metadata for this dataset)\b/.test(text)
     );
 }
 
@@ -550,21 +556,23 @@ function hasAnalysisIntent(question: string): boolean {
         return false;
     }
     return (
-        /(分析|查询|统计|筛选|过滤|聚合|分组|计数|排序|top|按.*统计|计算|对比|sql)/.test(
+        /(分析|查询|统计|筛选|过滤|聚合|分组|计数|排序|top|按.*统计|计算|对比|sql|加载)/.test(
             text
         ) ||
-        /\b(analy[sz]e|analysis|query|filter|where|group by|count|sum|avg|min|max|top\s*\d+|compare|sql)\b/.test(
+        /\b(analy[sz]e|analysis|query|filter|where|group by|count|sum|avg|average|min|minimum|max|maximum|total|top\s*\d+|compare|sql)\b/.test(
             text
-        )
+        ) ||
+        /\b(geodesic|loaded|postgis|geograph(y|ic)|combined|containing|frequent|common)\b/.test(
+            text
+        ) ||
+        /\b(shape_[a-z0-9_]+|st_[a-z0-9_]+)\b/i.test(text) ||
+        /\b(longer than|shorter than|square meters?|typed as)\b/.test(text)
     );
 }
 
-function needsDataQuery(question: string): boolean {
+function hasStrongDataQueryIntent(question: string): boolean {
     const text = (question || "").toLowerCase().trim();
     if (!text) {
-        return false;
-    }
-    if (hasGreetingIntent(text) || hasDatasetDescriptionIntent(text)) {
         return false;
     }
     return (
@@ -572,14 +580,30 @@ function needsDataQuery(question: string): boolean {
         /(显示|展示|列出|查|查询|筛选|过滤|统计|多少|哪些|有哪些|给我|看一下|导出|下载|明细|记录|行)/.test(
             text
         ) ||
-        /\b(show|list|find|get|fetch|retrieve|return|display|rows?|records?|which|what are|how many|number of|total number|count of)\b/.test(
+        /\b(show|list|find|get|fetch|retrieve|return|display|rows?|records?|which|what are|how many|number of|total number|count of|count\b)\b/.test(
             text
         ) ||
-        /\b(which|what)\b[\s\S]{0,60}\b(most|least|more|fewer|highest|lowest)\b/i.test(
+        /\b(which|what)\b[\s\S]{0,80}\b(most|least|more|fewer|highest|lowest|maximum|minimum|average|total|geodesic)\b/i.test(
             text
         ) ||
-        /\b(top\s*\d+|bottom\s*\d+|breakdown|grouped?\s+by)\b/i.test(text)
+        /\b(top\s*\d+|bottom\s*\d+|breakdown|grouped?\s+by|loaded in|passes?)\b/i.test(
+            text
+        )
     );
+}
+
+function needsDataQuery(question: string): boolean {
+    const text = (question || "").toLowerCase().trim();
+    if (!text || hasGreetingIntent(text)) {
+        return false;
+    }
+    if (hasStrongDataQueryIntent(text)) {
+        return true;
+    }
+    if (hasDatasetDescriptionIntent(text)) {
+        return false;
+    }
+    return false;
 }
 
 function needsSpatialReasoning(question: string): boolean {
