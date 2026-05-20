@@ -16,7 +16,7 @@
     "test": "craco test --react-scripts ../node_modules/react-scripts",
     "eject": "react-scripts eject",
     "analyze": "source-map-explorer 'build/static/js/*.js'",
-    "sync-eval-data": "node scripts/sync-geosql-eval-data.mjs"
+    "sync-magda-eval-data": "node scripts/sync-magda-eval-data.mjs"
   },
   "cracoConfig": "craco.config.cjs",
   "dependencies": {

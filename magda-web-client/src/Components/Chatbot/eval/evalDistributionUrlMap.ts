@@ -27,7 +27,7 @@ export function clearEvalDistributionUrlMappings(): void {
 
 /**
  * Register that fetching `fakeAbsoluteUrl` should load static assets at `sameOriginPath`
- * (must start with `/`, e.g. `/eval-data/tiger-files/foo.zip`).
+ * (must start with `/`, e.g. `/eval-data/magda/geojson/foo.geojson`).
  */
 export function registerEvalDistributionMapping(
     fakeAbsoluteUrl: string,
@@ -45,10 +45,10 @@ export function registerEvalDistributionMapping(
 /** Stable fake URL builder — pair with `registerEvalDistributionMapping`. */
 export function buildGeoEvalFakeDistributionUrl(
     datasetId: string,
-    zipFile: string
+    resourceFileName: string
 ): string {
     const encDs = encodeURIComponent(datasetId);
-    const encZip = encodeURIComponent(zipFile);
+    const encZip = encodeURIComponent(resourceFileName);
     return `https://geosql-eval.invalid/registry/dataset/${encDs}/distribution/resource/${encZip}`;
 }
 

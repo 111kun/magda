@@ -19,6 +19,8 @@ import {
     applyGoldSqlCompatView,
     buildParsedDatasetForGeoEval,
     createGeoEvalAgentChain,
+    evalCasesUrlForDataset,
+    evalSchemaUrlForDataset,
     registerGeoEvalDatasetMappings,
     resetGeoEvalDistributionMappings
 } from "./geoEvalFixtures";
@@ -120,7 +122,7 @@ type AllDatasetsReport = {
 };
 
 const DEFAULT_MODEL = "Hermes-3-Llama-3.1-8B-q4f16_1-MLC";
-const META_URL = "/eval-data/datasets-meta.json";
+const MAGDA_META_URL = "/eval-data/magda-datasets-meta.json";
 
 type PgExecResult = {
     ok: boolean;
@@ -394,30 +396,37 @@ const GeoSqlEvalRunnerPage: React.FC = () => {
     );
 
     useEffect(() => {
-        fetch(META_URL)
-            .then((r) => {
-                if (!r.ok) throw new Error(`fetch ${META_URL} -> ${r.status}`);
-                return r.json();
-            })
-            .then((data: DatasetMeta[]) => {
-                setDatasets(data);
+        const loadMeta = async () => {
+            try {
+                const r = await fetch(MAGDA_META_URL);
+                if (!r.ok) {
+                    throw new Error(`HTTP ${r.status}`);
+                }
+                const magdaDatasets = (await r.json()) as DatasetMeta[];
+                setDatasets(magdaDatasets);
                 appendLog(
-                    `Loaded ${data.length} dataset preset(s) from ${META_URL}`
+                    `Loaded ${magdaDatasets.length} Magda dataset preset(s).`
                 );
-            })
-            .catch((e) => {
+            } catch (e) {
+                setDatasets([]);
                 appendLog(
-                    `Could not load dataset presets (${
+                    `No Magda dataset presets found. Run \`npm run sync-magda-eval-data\` from magda-web-client, or paste JSONL below. (${
                         (e as Error).message
-                    }). From magda-web-client run \`npm run sync-eval-data\` (writes public/eval-data/) to enable presets, or paste JSONL manually below.`
+                    })`
                 );
-            });
+            }
+        };
+        loadMeta().catch((e) => {
+            appendLog(
+                `Could not load dataset presets: ${(e as Error).message}`
+            );
+        });
     }, [appendLog]);
 
     useEffect(() => {
         if (!selectedDataset) return;
-        const casesUrl = `/eval-data/by-ddl/${selectedDataset.jsonl_file}`;
-        const ddlUrl = `/eval-data/ddl/${selectedDataset.ddl_file}`;
+        const casesUrl = evalCasesUrlForDataset(selectedDataset);
+        const ddlUrl = evalSchemaUrlForDataset(selectedDataset);
         Promise.all([
             fetch(casesUrl).then((r) => r.text()),
             fetch(ddlUrl).then((r) => r.text())
@@ -487,9 +496,9 @@ const GeoSqlEvalRunnerPage: React.FC = () => {
                 );
                 return null;
             }
-            if (!datasetMeta?.zip_file) {
+            if (!datasetMeta?.geojson_file) {
                 appendLog(
-                    "Dataset preset missing zip_file — cannot map fake download URL to local static assets."
+                    "Dataset preset missing geojson_file — cannot map fake download URL to local static assets."
                 );
                 return null;
             }
@@ -522,8 +531,14 @@ const GeoSqlEvalRunnerPage: React.FC = () => {
                     onRunLog: (m) => appendLog(`[${datasetId}] warmup: ${m}`)
                 }
             );
-            appendLog(`[${datasetId}] Applying gold-sql compat VIEW…`);
-            await applyGoldSqlCompatView(datasetMeta.table);
+            if (!datasetMeta.skip_compat_view) {
+                appendLog(`[${datasetId}] Applying gold-sql compat VIEW…`);
+                await applyGoldSqlCompatView(datasetMeta.table);
+            } else {
+                appendLog(
+                    `[${datasetId}] Skipping compat VIEW (gold SQL uses features).`
+                );
+            }
 
             const evalDist = parsed.distributions[0];
             const evalUrl = getDistributionUrl(evalDist);
@@ -750,7 +765,7 @@ const GeoSqlEvalRunnerPage: React.FC = () => {
                 try {
                     appendLog(`[all] loading dataset ${ds.id}`);
                     const casesRaw = await fetch(
-                        `/eval-data/by-ddl/${ds.jsonl_file}`
+                        evalCasesUrlForDataset(ds)
                     ).then((r) => r.text());
                     const parsedCases = parseJsonl(casesRaw);
                     const built = await evaluateCasesForDataset(
@@ -847,7 +862,7 @@ const GeoSqlEvalRunnerPage: React.FC = () => {
                 the dataset chatbot): <code>datasetProfile</code> enrichment,{" "}
                 <code>decideChatRoute</code>, and <code>queryGeoDataset</code>.
                 Distribution download URLs are fake registry URLs rewritten to{" "}
-                <code>/eval-data/tiger-files/*.zip</code> via{" "}
+                <code>/eval-data/magda/geojson/*.geojson</code> via{" "}
                 <code>getDistributionUrl</code>. Dev/eval only.
             </p>
 

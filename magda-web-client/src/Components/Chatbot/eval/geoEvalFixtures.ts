@@ -17,6 +17,13 @@ export type GeoEvalDatasetMeta = {
     ddl_file: string;
     jsonl_file: string;
     zip_file: string | null;
+    /** Magda fixtures: static GeoJSON under `/eval-data/magda/geojson/`. */
+    geojson_file?: string | null;
+    format?: string;
+    /** When true, gold SQL targets `features` directly (no compat VIEW needed). */
+    skip_compat_view?: boolean;
+    /** Subpath under `/eval-data/` for JSONL (default `magda/cases`). */
+    cases_path?: string;
     table: string;
     columns: string[];
     cases_total: number;
@@ -49,15 +56,15 @@ function minimalDistribution(
 export function buildParsedDatasetForGeoEval(
     meta: GeoEvalDatasetMeta
 ): ParsedDataset {
-    if (!meta.zip_file) {
-        throw new Error(`Dataset ${meta.id} has no zip_file`);
+    if (!meta.geojson_file) {
+        throw new Error(`Dataset ${meta.id} needs geojson_file`);
     }
-    const fakeUrl = buildGeoEvalFakeDistributionUrl(meta.id, meta.zip_file);
+    const fakeUrl = buildGeoEvalFakeDistributionUrl(meta.id, meta.geojson_file);
     const dist: ParsedDistribution = minimalDistribution({
         identifier: `eval-dist-${meta.id}`,
         title: meta.table || meta.label,
         description: `GeoSQL eval fixture (${meta.id})`,
-        format: "ESRI SHAPEFILE",
+        format: meta.format || "GEOJSON",
         downloadURL: fakeUrl
     });
     return {
@@ -65,7 +72,7 @@ export function buildParsedDatasetForGeoEval(
         title: meta.label || meta.id,
         description: `GeoSQL benchmark fixture ${meta.id}`,
         landingPage: "",
-        tags: ["geosql-eval"],
+        tags: ["magda-eval"],
         distributions: [dist],
         themes: [],
         publisher: emptyPublisher,
@@ -76,16 +83,26 @@ export function buildParsedDatasetForGeoEval(
     };
 }
 
-/** Register fake registry URL → local static zip under `/eval-data/tiger-files/`. */
+/** Register fake registry URL → local static asset under `/eval-data/...`. */
 export function registerGeoEvalDatasetMappings(meta: GeoEvalDatasetMeta): void {
-    if (!meta.zip_file) {
+    if (!meta.geojson_file) {
         return;
     }
-    const fakeUrl = buildGeoEvalFakeDistributionUrl(meta.id, meta.zip_file);
-    registerEvalDistributionMapping(
-        fakeUrl,
-        `/eval-data/tiger-files/${meta.zip_file}`
-    );
+    const fakeUrl = buildGeoEvalFakeDistributionUrl(meta.id, meta.geojson_file);
+    const staticPath = `/eval-data/magda/geojson/${meta.geojson_file}`;
+    registerEvalDistributionMapping(fakeUrl, staticPath);
+}
+
+export function evalCasesUrlForDataset(meta: GeoEvalDatasetMeta): string {
+    const base = meta.cases_path || "magda/cases";
+    return `/eval-data/${base}/${meta.jsonl_file}`;
+}
+
+export function evalSchemaUrlForDataset(meta: GeoEvalDatasetMeta): string {
+    if ((meta.cases_path || "magda/cases") === "magda/cases") {
+        return `/eval-data/magda/schema/${meta.ddl_file}`;
+    }
+    return `/eval-data/ddl/${meta.ddl_file}`;
 }
 
 export function resetGeoEvalDistributionMappings(): void {
@@ -97,7 +114,7 @@ export async function applyGoldSqlCompatView(tableName: string): Promise<void> {
     const resp = await fetch(`/eval-data/features-views/${tableName}.sql`);
     if (!resp.ok) {
         throw new Error(
-            `Missing compat view for ${tableName} (${resp.status}). From magda-web-client run \`npm run sync-eval-data\` so public/eval-data/features-views/ exists.`
+            `Missing compat view for ${tableName} (${resp.status}). Keep \`skip_compat_view: true\` in Magda eval metadata, or prepare a compat SQL under public/eval-data/features-views/.`
         );
     }
     const sql = await resp.text();

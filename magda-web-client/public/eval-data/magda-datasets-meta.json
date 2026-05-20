@@ -1,0 +1,69 @@
+[
+    {
+        "id": "magda-land-zones",
+        "label": "Magda — Land Development Zones (GDA2020)",
+        "ddl_file": "magda-land-zones-schema.txt",
+        "jsonl_file": "land-development-zones.jsonl",
+        "zip_file": null,
+        "geojson_file": "LandDevelopmentZones_GDA2020.geojson",
+        "format": "GEOJSON",
+        "table": "features",
+        "skip_compat_view": true,
+        "cases_path": "magda/cases",
+        "columns": [
+            "zone",
+            "zone_meaning",
+            "dev_category",
+            "devplan_code",
+            "policy",
+            "precinct",
+            "shape_Area",
+            "shape_Length"
+        ],
+        "cases_total": 10,
+        "cases_single_table": 10,
+        "cases_multi_table": 0
+    },
+    {
+        "id": "magda-manningham-trees",
+        "label": "Magda — Manningham Street Trees",
+        "ddl_file": "magda-manningham-trees-schema.txt",
+        "jsonl_file": "manningham-street-trees.jsonl",
+        "zip_file": null,
+        "geojson_file": "Manningham_Street_Trees.geojson",
+        "format": "GEOJSON",
+        "table": "features",
+        "skip_compat_view": true,
+        "cases_path": "magda/cases",
+        "columns": [
+            "street",
+            "str_type",
+            "suburb",
+            "species",
+            "height",
+            "dbh",
+            "house",
+            "pcode",
+            "treearea"
+        ],
+        "cases_total": 10,
+        "cases_single_table": 10,
+        "cases_multi_table": 0
+    },
+    {
+        "id": "magda-road-segment",
+        "label": "Magda — Road Segment",
+        "ddl_file": "magda-road-segment-schema.txt",
+        "jsonl_file": "road-segment.jsonl",
+        "zip_file": null,
+        "geojson_file": "Road_Segment.geojson",
+        "format": "GEOJSON",
+        "table": "features",
+        "skip_compat_view": true,
+        "cases_path": "magda/cases",
+        "columns": ["name", "open", "visibility"],
+        "cases_total": 10,
+        "cases_single_table": 10,
+        "cases_multi_table": 0
+    }
+]
