@@ -65,6 +65,154 @@ function escapeRegExp(input: string): string {
     return input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+/** Split normalized question text into word-like tokens (no substring matching). */
+function tokenizeQuestion(text: string): string[] {
+    return text
+        .split(/[^a-z0-9\u4e00-\u9fff]+/g)
+        .map((t) => t.trim())
+        .filter((t) => t.length > 0);
+}
+
+/**
+ * True when the question mentions `valueNorm` as a whole token or consecutive
+ * token phrase — e.g. zone code R matches token "r", not the "r" inside "for".
+ */
+/** English tokens that must not bind value_sample (e.g. zone=In from "loaded in PostGIS"). */
+const VALUE_SAMPLE_STOP_TOKENS = new Set([
+    "in",
+    "on",
+    "or",
+    "is",
+    "as",
+    "at",
+    "to",
+    "of",
+    "an",
+    "the",
+    "be",
+    "by",
+    "it",
+    "no",
+    "so",
+    "if",
+    "up",
+    "for",
+    "and",
+    "are",
+    "was",
+    "has",
+    "had",
+    "how",
+    "any",
+    "all",
+    "per",
+    "sum",
+    "avg",
+    "max",
+    "min",
+    "top",
+    "use",
+    "who",
+    "what",
+    "when",
+    "where",
+    "which",
+    "this",
+    "that",
+    "with",
+    "from",
+    "have",
+    "into",
+    "loaded",
+    "postgis",
+    "dataset",
+    "data",
+    "feature",
+    "features",
+    "zone",
+    "zones",
+    "code",
+    "plan",
+    "land",
+    "development",
+    "count",
+    "total",
+    "number",
+    "many",
+    "most",
+    "least",
+    "common",
+    "frequent",
+    "across",
+    "property",
+    "properties",
+    "field",
+    "numeric",
+    "phrase",
+    "containing",
+    "square",
+    "meters",
+    "geodesic",
+    "geometry",
+    "geometries",
+    "polygon",
+    "polygons"
+]);
+
+const SINGLE_TOKEN_VALUE_SAMPLE_MIN_LEN = 3;
+
+function shouldSkipValueSampleBinding(valueNorm: string): boolean {
+    const tokens = tokenizeQuestion(valueNorm);
+    if (!tokens.length) {
+        return true;
+    }
+    if (tokens.length === 1) {
+        const t = tokens[0];
+        if (t.length < SINGLE_TOKEN_VALUE_SAMPLE_MIN_LEN) {
+            return true;
+        }
+        if (VALUE_SAMPLE_STOP_TOKENS.has(t)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+export function questionMentionsValueAsWords(
+    qNorm: string,
+    valueNorm: string
+): boolean {
+    const normalizedValue = norm(valueNorm);
+    if (!normalizedValue) {
+        return false;
+    }
+    const valueTokens = tokenizeQuestion(normalizedValue);
+    if (!valueTokens.length) {
+        return false;
+    }
+    const qTokens = tokenizeQuestion(qNorm);
+    if (!qTokens.length) {
+        return false;
+    }
+    if (valueTokens.length === 1) {
+        return qTokens.includes(valueTokens[0]);
+    }
+    const n = valueTokens.length;
+    for (let i = 0; i <= qTokens.length - n; i++) {
+        let matched = true;
+        for (let j = 0; j < n; j++) {
+            if (qTokens[i + j] !== valueTokens[j]) {
+                matched = false;
+                break;
+            }
+        }
+        if (matched) {
+            return true;
+        }
+    }
+    return false;
+}
+
 function detectIntentType(question: string): GeoQueryScope["intentType"] {
     const q = norm(question);
     if (!q) {
@@ -250,7 +398,10 @@ export function extractGeoQueryScope(input: {
             if (!valueNorm || matchedValueNorms.has(valueNorm)) {
                 continue;
             }
-            if (qNorm.includes(valueNorm)) {
+            if (
+                !shouldSkipValueSampleBinding(valueNorm) &&
+                questionMentionsValueAsWords(qNorm, valueNorm)
+            ) {
                 boundFilters.push({
                     key,
                     value: rawValue,
@@ -258,7 +409,9 @@ export function extractGeoQueryScope(input: {
                     source: "value_sample"
                 });
                 matchedValueNorms.add(valueNorm);
-                reasoningTrace.push(`value_sample_match:${key}=${rawValue}`);
+                reasoningTrace.push(
+                    `value_sample_word_match:${key}=${rawValue}`
+                );
                 break;
             }
         }
@@ -274,9 +427,16 @@ export function extractGeoQueryScope(input: {
     }
     const finalBoundFilters = [...dedup.values()];
 
+    const qTokens = tokenizeQuestion(qNorm);
     const datasetScopeMentions = (input.datasetScopeTerms || [])
         .map((term) => norm(term))
-        .filter((term) => !!term && qNorm.includes(term))
+        .filter(
+            (term) =>
+                !!term &&
+                (term.includes(" ")
+                    ? questionMentionsValueAsWords(qNorm, term)
+                    : qTokens.includes(term))
+        )
         .slice(0, 12);
 
     const externalPlace = inferExternalPlace(question);
