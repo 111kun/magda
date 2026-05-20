@@ -93,12 +93,6 @@ const CatalogRoutes = makeAsync(() =>
 const SettingsRoutes = makeAsync(() =>
     import("Components/Settings/Routes").then((module) => module.default)
 );
-const GeoSqlEvalRunnerPage = makeAsync(() =>
-    import("Components/Chatbot/eval/GeoSqlEvalRunnerPage").then(
-        (module) => module.default
-    )
-);
-
 const Routes = () => {
     return (
         <Switch>
@@ -308,15 +302,6 @@ const Routes = () => {
                 path="/error"
                 component={withHeader(ErrorPage, { includeSearchBox: true })}
             />
-            {process.env.NODE_ENV === "development" && (
-                <Route
-                    exact
-                    path="/geosql-eval"
-                    component={withHeader(GeoSqlEvalRunnerPage as any, {
-                        includeSearchBox: true
-                    })}
-                />
-            )}
             <FallbackRouteHandlerPage />
         </Switch>
     );

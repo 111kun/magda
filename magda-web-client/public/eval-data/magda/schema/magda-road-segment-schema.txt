@@ -1,2 +1,0 @@
--- Magda eval schema hint (browser table: features, MultiPolygon road footprints)
--- name, open, visibility, Folder — no road-name attributes; use ST_Length/ST_Area on geom

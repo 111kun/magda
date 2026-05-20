@@ -1,6 +1,5 @@
 import { ParsedDistribution } from "helpers/record";
 import resolveDistributionResourceUrl from "helpers/resolveDistributionResourceUrl";
-import { rewriteEvalDistributionSourceUrl } from "../../eval/evalDistributionUrlMap";
 
 const SPATIAL_FORMATS = new Set([
     "SHP",
@@ -25,8 +24,7 @@ export function getDistributionUrl(dist: ParsedDistribution): string | null {
     if (!raw) {
         return null;
     }
-    const sourceUrl = rewriteEvalDistributionSourceUrl(raw);
-    return resolveDistributionResourceUrl(sourceUrl);
+    return resolveDistributionResourceUrl(raw);
 }
 
 export function isGeoSpatialDistribution(dist: ParsedDistribution): boolean {

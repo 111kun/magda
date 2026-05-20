@@ -1,4 +1,0 @@
--- Magda eval schema hint (browser table: features, attributes in properties JSONB)
--- Keys from LandDevelopmentZones_GDA2020.geojson (full names in local fixture).
--- zone, zone_meaning, dev_category, devplan_code, policy, policy_meaning,
--- precinct, precinct_meaning, shape_Area, shape_Length, special_use, urban_centre

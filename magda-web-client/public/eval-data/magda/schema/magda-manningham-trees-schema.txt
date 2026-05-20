@@ -1,2 +1,0 @@
--- Magda eval schema hint (browser table: features)
--- street, str_type, suburb, species, height, dbh, house, pcode, date1, lat, lon, treearea, alphatree
