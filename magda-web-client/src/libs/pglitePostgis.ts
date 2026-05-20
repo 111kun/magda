@@ -116,6 +116,38 @@ function normalizeToFeatureCollection(input: any): GeoFeatureCollection {
     throw new Error("Unsupported GeoJSON structure");
 }
 
+/** Count geometries with valid geom; keep at most maxFeatures for import. */
+function capFeatureCollectionAtParse(
+    fc: GeoFeatureCollection,
+    maxFeatures: number
+): { collection: GeoFeatureCollection; totalValid: number } {
+    const limit = normalizeImportLimit(maxFeatures);
+    const capped: GeoFeature[] = [];
+    let totalValid = 0;
+    for (const f of fc.features) {
+        if (!f?.geometry) {
+            continue;
+        }
+        totalValid++;
+        if (capped.length < limit) {
+            capped.push(f);
+        }
+    }
+    return {
+        collection: { type: "FeatureCollection", features: capped },
+        totalValid
+    };
+}
+
+function addWfsFeatureCountCap(url: string, maxFeatures: number): string {
+    const n = String(normalizeImportLimit(maxFeatures));
+    return addOrUpdateUrlParam(
+        addOrUpdateUrlParam(url, "count", n),
+        "maxFeatures",
+        n
+    );
+}
+
 async function createInstance(): Promise<PGliteType> {
     const [{ PGlite }, { postgis }] = await Promise.all([
         import(
@@ -179,7 +211,10 @@ export async function importGeoJsonFromUrl(
     return importSpatialFromDistribution(targetUrl, "GEOJSON");
 }
 
-function toFeatureCollectionFromCsv(text: string): GeoFeatureCollection {
+function toFeatureCollectionFromCsv(
+    text: string,
+    maxFeatures?: number
+): { collection: GeoFeatureCollection; totalValid: number } {
     const parsed = Papa.parse<Record<string, any>>(text, {
         header: true,
         skipEmptyLines: true
@@ -189,7 +224,10 @@ function toFeatureCollectionFromCsv(text: string): GeoFeatureCollection {
     }
     const rows = parsed.data || [];
     if (!rows.length) {
-        return { type: "FeatureCollection", features: [] };
+        return {
+            collection: { type: "FeatureCollection", features: [] },
+            totalValid: 0
+        };
     }
 
     const first = rows[0];
@@ -212,34 +250,61 @@ function toFeatureCollectionFromCsv(text: string): GeoFeatureCollection {
         throw new Error("Cannot detect lat/lon columns from CSV.");
     }
 
-    const features: GeoFeature[] = rows
-        .map((r): GeoFeature | null => {
-            const lon = Number(r[lonKey]);
-            const lat = Number(r[latKey]);
-            if (!Number.isFinite(lon) || !Number.isFinite(lat)) {
-                return null;
-            }
-            return {
+    const limit =
+        typeof maxFeatures === "number" && maxFeatures > 0
+            ? normalizeImportLimit(maxFeatures)
+            : Number.POSITIVE_INFINITY;
+    const features: GeoFeature[] = [];
+    let totalValid = 0;
+    for (const r of rows) {
+        const lon = Number(r[lonKey]);
+        const lat = Number(r[latKey]);
+        if (!Number.isFinite(lon) || !Number.isFinite(lat)) {
+            continue;
+        }
+        totalValid++;
+        if (features.length < limit) {
+            features.push({
                 type: "Feature",
                 geometry: { type: "Point", coordinates: [lon, lat] },
                 properties: r ?? null
-            };
-        })
-        .filter((f): f is GeoFeature => !!f);
+            });
+        }
+    }
 
-    return { type: "FeatureCollection", features };
+    return {
+        collection: { type: "FeatureCollection", features },
+        totalValid
+    };
 }
 
 async function toFeatureCollectionFromDistribution(
     targetUrl: string,
     format?: string,
-    distributionTitle?: string
-): Promise<GeoFeatureCollection> {
+    distributionTitle?: string,
+    maxFeatures?: number
+): Promise<{ collection: GeoFeatureCollection; totalValid: number }> {
     const fmt = normalizeFormat(format);
+    const capLimit =
+        typeof maxFeatures === "number" && maxFeatures > 0
+            ? normalizeImportLimit(maxFeatures)
+            : null;
+    const finish = (fc: GeoFeatureCollection) => {
+        if (capLimit != null) {
+            return capFeatureCollectionAtParse(fc, capLimit);
+        }
+        let totalValid = 0;
+        for (const f of fc.features) {
+            if (f?.geometry) {
+                totalValid++;
+            }
+        }
+        return { collection: fc, totalValid };
+    };
 
     if (fmt === "CSV-GEO-AU") {
         const text = await fetchTextViaGeoProxy(targetUrl);
-        return toFeatureCollectionFromCsv(text);
+        return toFeatureCollectionFromCsv(text, maxFeatures);
     }
 
     if (fmt === "WFS") {
@@ -307,12 +372,20 @@ async function toFeatureCollectionFromDistribution(
             baseWithTypeNames,
             targetUrl
         ];
-        const uniqueCandidates = [...new Set(wfsCandidates)];
+        const uniqueCandidates = [
+            ...new Set(
+                capLimit != null
+                    ? wfsCandidates.map((u) =>
+                          addWfsFeatureCountCap(u, capLimit)
+                      )
+                    : wfsCandidates
+            )
+        ];
         let lastError: unknown = null;
         for (const wfsUrl of uniqueCandidates) {
             try {
                 const raw = await fetchGeoJsonViaGeoProxy<any>(wfsUrl);
-                return normalizeToFeatureCollection(raw);
+                return finish(normalizeToFeatureCollection(raw));
             } catch (e) {
                 lastError = e;
             }
@@ -329,7 +402,7 @@ async function toFeatureCollectionFromDistribution(
         const parser = new DOMParser();
         const xml = parser.parseFromString(text, "text/xml");
         const raw = kmlToGeoJson(xml as any);
-        return normalizeToFeatureCollection(raw);
+        return finish(normalizeToFeatureCollection(raw));
     }
 
     if (
@@ -343,14 +416,17 @@ async function toFeatureCollectionFromDistribution(
             const merged: GeoFeature[] = raw
                 .filter((fc) => fc?.type === "FeatureCollection")
                 .flatMap((fc) => fc.features || []);
-            return { type: "FeatureCollection", features: merged };
+            return finish({
+                type: "FeatureCollection",
+                features: merged
+            });
         }
-        return normalizeToFeatureCollection(raw);
+        return finish(normalizeToFeatureCollection(raw));
     }
 
     // Default path: treat as GeoJSON.
     const raw = await fetchGeoJsonViaGeoProxy<any>(targetUrl);
-    return normalizeToFeatureCollection(raw);
+    return finish(normalizeToFeatureCollection(raw));
 }
 
 export async function importSpatialFromDistribution(
@@ -360,16 +436,17 @@ export async function importSpatialFromDistribution(
     options?: { maxFeatures?: number }
 ): Promise<ImportSpatialResult> {
     const pg = await getPGlitePostgis();
-    const fc = await toFeatureCollectionFromDistribution(
+    const maxFeatures = normalizeImportLimit(options?.maxFeatures);
+    const {
+        collection: fc,
+        totalValid
+    } = await toFeatureCollectionFromDistribution(
         targetUrl,
         format,
-        distributionTitle
+        distributionTitle,
+        maxFeatures
     );
-    const maxFeatures = normalizeImportLimit(options?.maxFeatures);
-    const validFeatures = fc.features.filter(
-        (f): f is GeoFeature => !!f?.geometry
-    );
-    const importFeatures = validFeatures.slice(0, maxFeatures);
+    const importFeatures = fc.features;
 
     await pg.exec("TRUNCATE features;");
     let inserted = 0;
@@ -414,13 +491,12 @@ export async function importSpatialFromDistribution(
         );
         inserted++;
     }
-    const totalFeatures = validFeatures.length;
     loadedDistribution = { url: targetUrl, inserted, maxFeatures };
     return {
         inserted,
-        totalFeatures,
-        skippedFeatures: Math.max(totalFeatures - inserted, 0),
+        totalFeatures: totalValid,
+        skippedFeatures: Math.max(totalValid - inserted, 0),
         maxFeatures,
-        truncated: totalFeatures > inserted
+        truncated: totalValid > inserted
     };
 }

@@ -7,3 +7,4 @@ magda-web-client/public/assets/libs/*
 .travis.yml
 *.html
 packages/external-ui-plugin-sdk/docs
+magda-web-client/public/magda-eval/**/*.jsonl

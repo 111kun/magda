@@ -27,6 +27,11 @@ const ChatBoxRoutes: FunctionComponent = () => (
                     path="/dataset/:datasetId"
                     component={ChatBoxLaunchButton}
                 />
+                <Route
+                    exact
+                    path="/geosql-eval"
+                    component={ChatBoxLaunchButton}
+                />
                 <Route path="/page/:pageId" component={ChatBoxLaunchButton} />
                 <Route path="/error" exact component={ChatBoxLaunchButton} />
             </Switch>

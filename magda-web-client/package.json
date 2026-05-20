@@ -6,6 +6,7 @@
   "license": "Apache-2.0",
   "homepage": ".",
   "scripts": {
+    "sync-magda-eval": "node scripts/sync-magda-eval-to-public.mjs",
     "dev": "yarn build-bundles && yarn run start",
     "start": "craco start",
     "build2": "react-scripts build",

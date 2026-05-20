@@ -1,0 +1,14 @@
+{
+    "land_zones": {
+        "title": "Land Development Zones",
+        "magda_dataset_id": "ds-sa-0ffa95bd-9345-4dd5-aa22-e91158538743"
+    },
+    "manningham_trees": {
+        "title": "Manningham Street Trees",
+        "magda_dataset_id": "ds-dga-1aef5123-24ff-4084-a0f1-a52ca71e9e99"
+    },
+    "road_segment": {
+        "title": "Road Segment",
+        "magda_dataset_id": "ds-dga-b435f45e-2073-446b-aff3-1feb97d9422e"
+    }
+}
