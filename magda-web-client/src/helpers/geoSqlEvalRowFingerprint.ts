@@ -1,29 +1,173 @@
 /**
- * Deterministic fingerprint of PostGIS query rows for GeoSQL eval (gold vs model).
+ * GeoSQL eval Layer B: semantic result comparison (no strict JSON row fingerprint).
  */
-function jsonReplacer(_key: string, value: unknown): unknown {
+export type GeoSqlResultMatchMode = "scalar" | "rows" | "none";
+
+export type GeoSqlResultCompare = {
+    match: boolean;
+    mode: GeoSqlResultMatchMode;
+};
+
+const SCALAR_ABS_EPS = 1e-9;
+const SCALAR_REL_EPS = 1e-6;
+
+function coerceToNumber(value: unknown): number | null {
+    if (value === null || value === undefined) {
+        return 0;
+    }
+    if (typeof value === "number") {
+        return Number.isFinite(value) ? value : null;
+    }
     if (typeof value === "bigint") {
-        return value.toString();
+        return Number(value);
     }
-    return value;
+    if (typeof value === "string") {
+        const t = value.trim();
+        if (!t) {
+            return null;
+        }
+        const n = Number(t);
+        return Number.isFinite(n) ? n : null;
+    }
+    return null;
 }
 
-function sortKeysDeep(value: unknown): unknown {
-    if (value === null || typeof value !== "object") {
-        return value;
+function numbersClose(a: number, b: number): boolean {
+    const diff = Math.abs(a - b);
+    if (diff <= SCALAR_ABS_EPS) {
+        return true;
     }
-    if (Array.isArray(value)) {
-        return value.map((v) => sortKeysDeep(v));
-    }
-    const obj = value as Record<string, unknown>;
-    const out: Record<string, unknown> = {};
-    for (const k of Object.keys(obj).sort()) {
-        out[k] = sortKeysDeep(obj[k]);
-    }
-    return out;
+    const scale = Math.max(1, Math.abs(a), Math.abs(b));
+    return diff / scale <= SCALAR_REL_EPS;
 }
 
-export function fingerprintQueryRows(rows: Record<string, unknown>[]): string {
-    const normalized = rows.map((r) => sortKeysDeep(r));
-    return JSON.stringify(normalized, jsonReplacer);
+function sortedNumericValues(rows: Record<string, unknown>[]): number[] {
+    const nums: number[] = [];
+    for (const row of rows) {
+        for (const v of Object.values(row)) {
+            const n = coerceToNumber(v);
+            if (n !== null) {
+                nums.push(n);
+            }
+        }
+    }
+    return nums.sort((a, b) => a - b);
+}
+
+function rowIsNumericScalar(row: Record<string, unknown>): boolean {
+    const values = Object.values(row);
+    if (!values.length) {
+        return false;
+    }
+    return values.every((v) => coerceToNumber(v) !== null);
+}
+
+export function isScalarResultSet(rows: Record<string, unknown>[]): boolean {
+    return rows.length === 1 && rowIsNumericScalar(rows[0]);
+}
+
+function scalarNumericMatch(
+    goldRows: Record<string, unknown>[],
+    modelRows: Record<string, unknown>[]
+): boolean {
+    const goldNums = sortedNumericValues(goldRows);
+    const modelNums = sortedNumericValues(modelRows);
+    if (goldNums.length !== modelNums.length) {
+        return false;
+    }
+    for (let i = 0; i < goldNums.length; i++) {
+        if (!numbersClose(goldNums[i], modelNums[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/** Column-agnostic row signature: sorted text dims + sorted numeric measures. */
+function rowComparableSignature(row: Record<string, unknown>): string {
+    const texts: string[] = [];
+    const nums: number[] = [];
+    for (const v of Object.values(row)) {
+        if (v === null || v === undefined) {
+            continue;
+        }
+        const asNum = coerceToNumber(v);
+        if (typeof v === "number" || typeof v === "bigint") {
+            if (asNum !== null) {
+                nums.push(asNum);
+            }
+            continue;
+        }
+        if (typeof v === "string") {
+            const t = v.trim();
+            if (!t) {
+                continue;
+            }
+            const parsed = Number(t);
+            if (
+                Number.isFinite(parsed) &&
+                /^-?\d+(?:\.\d+)?$/.test(t.replace(/,/g, ""))
+            ) {
+                nums.push(parsed);
+            } else {
+                texts.push(t.toLowerCase());
+            }
+            continue;
+        }
+        texts.push(String(v).toLowerCase());
+    }
+    texts.sort();
+    nums.sort((a, b) => a - b);
+    return `${texts.join("\u001f")}\u001e${nums.join(",")}`;
+}
+
+function rowSetMatch(
+    goldRows: Record<string, unknown>[],
+    modelRows: Record<string, unknown>[]
+): boolean {
+    const goldSigs = goldRows.map(rowComparableSignature).sort();
+    const modelSigs = modelRows.map(rowComparableSignature).sort();
+    if (goldSigs.length !== modelSigs.length) {
+        return false;
+    }
+    for (let i = 0; i < goldSigs.length; i++) {
+        if (goldSigs[i] !== modelSigs[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+export function compareQueryResults(
+    goldRows: Record<string, unknown>[],
+    modelRows: Record<string, unknown>[]
+): GeoSqlResultCompare {
+    if (goldRows.length !== modelRows.length) {
+        return { match: false, mode: "none" };
+    }
+    if (!goldRows.length) {
+        return { match: true, mode: "scalar" };
+    }
+
+    const goldScalar = isScalarResultSet(goldRows);
+    const modelScalar = isScalarResultSet(modelRows);
+
+    if (goldScalar && modelScalar) {
+        return {
+            match: scalarNumericMatch(goldRows, modelRows),
+            mode: "scalar"
+        };
+    }
+
+    return {
+        match: rowSetMatch(goldRows, modelRows),
+        mode: "rows"
+    };
+}
+
+/** Human-readable signature for reports (not used for strict JSON fingerprint equality). */
+export function rowsToComparableSignature(
+    rows: Record<string, unknown>[]
+): string {
+    return JSON.stringify(rows.map(rowComparableSignature).sort());
 }

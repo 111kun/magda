@@ -23,8 +23,9 @@ import {
     downloadJsonReport,
     EvalCaseRow,
     GeoSqlEvalReport,
+    compareQueryResults,
     isReadableSql,
-    rowsToFingerprint
+    rowsToComparableSignature
 } from "helpers/geoSqlEvalReport";
 import {
     ChatEventMessage,
@@ -410,6 +411,7 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                         },
                         layer_b: {
                             result_match: false,
+                            match_mode: "none",
                             gold_fingerprint: "",
                             model_fingerprint: "",
                             gold_row_count: 0,
@@ -458,15 +460,25 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                     goldErr = String(e);
                 }
 
-                const goldFp = goldExecOk ? rowsToFingerprint(goldRows) : "";
+                const goldFp = goldExecOk
+                    ? rowsToComparableSignature(goldRows)
+                    : "";
                 let modelFp = "";
                 let modelRowCount = 0;
                 let resultMatch = false;
+                let matchMode: EvalCaseRow["layer_b"]["match_mode"] = "none";
 
                 if (execFinal.ok && execFinal.rows) {
-                    modelFp = rowsToFingerprint(execFinal.rows);
+                    modelFp = rowsToComparableSignature(execFinal.rows);
                     modelRowCount = execFinal.rows.length;
-                    resultMatch = goldExecOk && goldFp === modelFp;
+                    if (goldExecOk) {
+                        const compared = compareQueryResults(
+                            goldRows,
+                            execFinal.rows
+                        );
+                        resultMatch = compared.match;
+                        matchMode = compared.mode;
+                    }
                 }
 
                 const errFirst = execFirst.error || collected.streamError;
@@ -499,6 +511,7 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                     },
                     layer_b: {
                         result_match: resultMatch,
+                        match_mode: matchMode,
                         gold_fingerprint: goldFp,
                         model_fingerprint: modelFp,
                         gold_row_count: goldRows.length,
@@ -513,7 +526,12 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                 caseRows.push(row);
 
                 if (resultMatch) {
-                    snapLog(`  ✓ Layer B 通过（结果指纹一致）`, "ok");
+                    snapLog(
+                        matchMode === "scalar"
+                            ? `  ✓ Layer B 通过（标量数值一致）`
+                            : `  ✓ Layer B 通过（多行语义一致）`,
+                        "ok"
+                    );
                 } else if (!sqlFinal) {
                     snapLog(`  ✗ 未捕获最终 SQL`, "error");
                 } else if (!execFinal.ok) {
@@ -522,7 +540,12 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                         "error"
                     );
                 } else {
-                    snapLog(`  ✗ Layer B 指纹不一致`, "warn");
+                    snapLog(
+                        matchMode === "scalar"
+                            ? `  ✗ Layer B 标量数值不一致`
+                            : `  ✗ Layer B 多行结果不一致`,
+                        "warn"
+                    );
                 }
                 snapLog(
                     `  Layer A: SA ${saFirst ? "✓" : "✗"}/${

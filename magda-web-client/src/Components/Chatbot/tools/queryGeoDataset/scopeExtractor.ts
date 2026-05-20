@@ -77,6 +77,107 @@ function tokenizeQuestion(text: string): string[] {
  * True when the question mentions `valueNorm` as a whole token or consecutive
  * token phrase — e.g. zone code R matches token "r", not the "r" inside "for".
  */
+/** English tokens that must not bind value_sample (e.g. zone=In from "loaded in PostGIS"). */
+const VALUE_SAMPLE_STOP_TOKENS = new Set([
+    "in",
+    "on",
+    "or",
+    "is",
+    "as",
+    "at",
+    "to",
+    "of",
+    "an",
+    "the",
+    "be",
+    "by",
+    "it",
+    "no",
+    "so",
+    "if",
+    "up",
+    "for",
+    "and",
+    "are",
+    "was",
+    "has",
+    "had",
+    "how",
+    "any",
+    "all",
+    "per",
+    "sum",
+    "avg",
+    "max",
+    "min",
+    "top",
+    "use",
+    "who",
+    "what",
+    "when",
+    "where",
+    "which",
+    "this",
+    "that",
+    "with",
+    "from",
+    "have",
+    "into",
+    "loaded",
+    "postgis",
+    "dataset",
+    "data",
+    "feature",
+    "features",
+    "zone",
+    "zones",
+    "code",
+    "plan",
+    "land",
+    "development",
+    "count",
+    "total",
+    "number",
+    "many",
+    "most",
+    "least",
+    "common",
+    "frequent",
+    "across",
+    "property",
+    "properties",
+    "field",
+    "numeric",
+    "phrase",
+    "containing",
+    "square",
+    "meters",
+    "geodesic",
+    "geometry",
+    "geometries",
+    "polygon",
+    "polygons"
+]);
+
+const SINGLE_TOKEN_VALUE_SAMPLE_MIN_LEN = 3;
+
+function shouldSkipValueSampleBinding(valueNorm: string): boolean {
+    const tokens = tokenizeQuestion(valueNorm);
+    if (!tokens.length) {
+        return true;
+    }
+    if (tokens.length === 1) {
+        const t = tokens[0];
+        if (t.length < SINGLE_TOKEN_VALUE_SAMPLE_MIN_LEN) {
+            return true;
+        }
+        if (VALUE_SAMPLE_STOP_TOKENS.has(t)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 export function questionMentionsValueAsWords(
     qNorm: string,
     valueNorm: string
@@ -297,7 +398,10 @@ export function extractGeoQueryScope(input: {
             if (!valueNorm || matchedValueNorms.has(valueNorm)) {
                 continue;
             }
-            if (questionMentionsValueAsWords(qNorm, valueNorm)) {
+            if (
+                !shouldSkipValueSampleBinding(valueNorm) &&
+                questionMentionsValueAsWords(qNorm, valueNorm)
+            ) {
                 boundFilters.push({
                     key,
                     value: rawValue,

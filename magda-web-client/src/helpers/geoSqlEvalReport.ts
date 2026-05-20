@@ -1,7 +1,11 @@
 /**
  * GeoSQL evaluation report (Layer A / Layer B per Final Report §4.3).
  */
-import { fingerprintQueryRows } from "./geoSqlEvalRowFingerprint";
+import {
+    compareQueryResults,
+    rowsToComparableSignature,
+    GeoSqlResultMatchMode
+} from "./geoSqlEvalRowFingerprint";
 
 export type GeoSqlEvalErrorBucket =
     | "syntax"
@@ -33,6 +37,8 @@ export type EvalCaseRow = {
     };
     layer_b: {
         result_match: boolean;
+        match_mode: GeoSqlResultMatchMode;
+        /** Semantic comparable signature (column-agnostic); not strict JSON fingerprint. */
         gold_fingerprint: string;
         model_fingerprint: string;
         gold_row_count: number;
@@ -177,7 +183,7 @@ export function buildReport(params: {
     return {
         meta: {
             framework:
-                "GeoSQL-Eval two-layer (Layer A: SA/EPR; Layer B: result fingerprint) — Final Report §4.3",
+                "GeoSQL-Eval two-layer (Layer A: SA/EPR; Layer B: scalar numeric or row-set semantic match) — Final Report §4.3",
             generated_at: new Date().toISOString(),
             dataset_slug: params.slug,
             magda_dataset_id: params.magdaDatasetId,
@@ -217,11 +223,12 @@ export function downloadCsvSummary(report: GeoSqlEvalReport): void {
         `layer_b_result_accuracy,${s.layer_b.result_accuracy.toFixed(4)}`,
         `layer_b_result_match_count,${s.layer_b.result_match_count}`,
         "",
-        "case_id,layer_b_result_match,sa_first,sa_final,epr_first,epr_final,repair_gain,error_bucket_final",
+        "case_id,layer_b_result_match,layer_b_match_mode,sa_first,sa_final,epr_first,epr_final,repair_gain,error_bucket_final",
         ...report.cases.map((c) =>
             [
                 c.case_id,
                 c.layer_b.result_match ? "1" : "0",
+                c.layer_b.match_mode,
                 c.layer_a.syntax_accuracy_first ? "1" : "0",
                 c.layer_a.syntax_accuracy_final ? "1" : "0",
                 c.layer_a.execution_pass_first ? "1" : "0",
@@ -248,6 +255,5 @@ function triggerDownload(blob: Blob, filename: string): void {
     URL.revokeObjectURL(url);
 }
 
-export function rowsToFingerprint(rows: Record<string, unknown>[]): string {
-    return fingerprintQueryRows(rows);
-}
+export { compareQueryResults, rowsToComparableSignature };
+export type { GeoSqlResultMatchMode };
