@@ -12,7 +12,7 @@ import {
     EVENT_TYPE_PARTIAL_MSG_FINISH,
     createChatEventMessage
 } from "../Messaging";
-import { WebLLMTool } from "../ChatWebLLM";
+import ChatWebLLM, { WebLLMTool } from "../ChatWebLLM";
 
 const systemPromptTpl = SystemMessagePromptTemplate.fromTemplate(
     `You are a friendly AI agent named "{appName}". \n` +
@@ -77,13 +77,18 @@ const defaultAgent: WebLLMTool = {
     name: "defaultAgent",
     func: async function () {
         const context = (this as unknown) as ChainInput;
-        const { model, queue, location } = context;
+        const { model: chatLlm, queue, location } = context;
+        if (!(chatLlm instanceof ChatWebLLM)) {
+            throw new Error(
+                "defaultAgent requires the WebLLM backend (streaming). Use WebLLM on the eval page or a tool-specific path."
+            );
+        }
         const prompt = ChatPromptTemplate.fromMessages([
             systemPromptTpl,
             HumanMessagePromptTemplate.fromTemplate("{question}")
         ]);
         const defaultAgentChain = prompt
-            .pipe(model)
+            .pipe(chatLlm)
             .pipe(new StringOutputParser());
 
         const stream = await defaultAgentChain.stream({
