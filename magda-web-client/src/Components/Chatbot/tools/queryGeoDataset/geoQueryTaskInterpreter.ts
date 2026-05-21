@@ -1,4 +1,4 @@
-import type { ServiceWorkerMLCEngine } from "@mlc-ai/web-llm/lib/extension_service_worker";
+import type { MagdaChatEngine } from "../../magdaLlmEngine";
 import { webLlmChatCompletion, webLlmResetChat } from "../../webLlmSerial";
 import type { GeoQueryScope } from "./scopeExtractor";
 
@@ -866,7 +866,7 @@ export async function resolveGeoQueryTaskSpec(input: {
     question: string;
     scope: GeoQueryScope;
     propertyKeys: string[];
-    getEngine: () => Promise<ServiceWorkerMLCEngine>;
+    getEngine: () => Promise<MagdaChatEngine>;
 }): Promise<GeoQueryTaskSpec> {
     const baseSpec = buildDeterministicTaskSpec(
         input.scope,

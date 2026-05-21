@@ -1,7 +1,7 @@
 import type AsyncQueue from "@ai-zen/async-queue";
 import type { ChatEventMessage } from "./Messaging";
 import type { History, Location } from "history";
-import ChatWebLLM from "./ChatWebLLM";
+import type { MagdaLlmModel } from "./magdaLlmModel";
 import { ParsedDataset, ParsedDistribution } from "helpers/record";
 export type LocationType = "DATASET_PAGE" | "DISTRIBUTION_PAGE" | "OTHERS";
 
@@ -95,7 +95,7 @@ export interface ChainInput {
     queue: AsyncQueue<ChatEventMessage>;
     history: History;
     location: Location;
-    model: ChatWebLLM;
+    model: MagdaLlmModel;
     dataset: ParsedDataset | undefined;
     distribution: ParsedDistribution | undefined;
     keyContextData: KeyContextData;

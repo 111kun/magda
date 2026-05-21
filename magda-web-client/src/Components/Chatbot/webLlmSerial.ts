@@ -1,7 +1,7 @@
 /**
  * Serialize WebLLM engine usage to avoid Extension BindingError (VectorInt).
  */
-import type { ServiceWorkerMLCEngine } from "@mlc-ai/web-llm/lib/extension_service_worker";
+import type { MagdaChatEngine } from "./magdaLlmEngine";
 import type {
     ChatCompletion,
     ChatCompletionChunk,
@@ -19,16 +19,14 @@ function enqueue<T>(fn: () => Promise<T>): Promise<T> {
     return run;
 }
 
-export async function webLlmResetChat(
-    engine: ServiceWorkerMLCEngine
-): Promise<void> {
+export async function webLlmResetChat(engine: MagdaChatEngine): Promise<void> {
     await enqueue(async () => {
         await engine.resetChat();
     });
 }
 
 export async function webLlmChatCompletion(
-    engine: ServiceWorkerMLCEngine,
+    engine: MagdaChatEngine,
     request: Omit<ChatCompletionRequest, "stream">
 ): Promise<ChatCompletion> {
     return enqueue(
@@ -41,7 +39,7 @@ export async function webLlmChatCompletion(
 }
 
 export async function webLlmChatCompletionStream(
-    engine: ServiceWorkerMLCEngine,
+    engine: MagdaChatEngine,
     request: Omit<ChatCompletionRequest, "stream">
 ): Promise<AsyncIterable<ChatCompletionChunk>> {
     return enqueue(

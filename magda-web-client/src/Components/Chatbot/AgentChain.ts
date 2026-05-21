@@ -3,7 +3,9 @@ import { ChainInput, KeyContextData } from "./commons";
 import { InitProgressCallback, InitProgressReport } from "@mlc-ai/web-llm";
 import { BaseMessage, AIMessage } from "@langchain/core/messages";
 import { Runnable, RunnableLambda } from "@langchain/core/runnables";
+import ChatEvalOpenAi, { ChatEvalOpenAiInputs } from "./ChatEvalOpenAi";
 import ChatWebLLM, { mergeWebLLMChatOptions, WebLLMInputs } from "./ChatWebLLM";
+import type { MagdaLlmModel } from "./magdaLlmModel";
 import { webLlmResetChat } from "./webLlmSerial";
 import AsyncQueue from "@ai-zen/async-queue";
 import {
@@ -25,6 +27,14 @@ import {
     makeDatasetProfileVersionKey
 } from "./datasetProfiling";
 import { decideChatRoute, SpatialIntentResult } from "./chatRouteRouter";
+
+export type AgentChainCreateOptions = {
+    attachToWindowDebug?: boolean;
+    webLlmCreateOptions?: Partial<WebLLMInputs>;
+    /** Eval harness: use OpenAI Chat Completions instead of browser WebLLM. */
+    llmProvider?: "webllm" | "openai";
+    openAi?: Partial<ChatEvalOpenAiInputs>;
+};
 
 class AgentChain {
     static agentChain: AgentChain | null = null;
@@ -63,6 +73,36 @@ class AgentChain {
             return AgentChain.agentChain;
         }
     }
+    /** GeoSQL eval: dedicated AgentChain instance (optional OpenAI backend). */
+    static createForEval(
+        appName: string,
+        navLocation: Location,
+        navHistory: History,
+        dataset: ParsedDataset | undefined,
+        distribution: ParsedDistribution | undefined,
+        loadProgressCallback?: InitProgressCallback,
+        errorHandler?: (e) => void,
+        options?: AgentChainCreateOptions
+    ): AgentChain {
+        AgentChain.agentChain = null;
+        if (loadProgressCallback) {
+            AgentChain.llmLoadProgressCallbacks.push(loadProgressCallback);
+        }
+        AgentChain.agentChain = new AgentChain(
+            appName,
+            navLocation,
+            navHistory,
+            dataset,
+            distribution,
+            (report) => {
+                AgentChain.llmLoadProgressCallbacks.forEach((cb) => cb(report));
+            },
+            { attachToWindowDebug: false, ...options }
+        );
+        void AgentChain.agentChain.initialize(errorHandler);
+        return AgentChain.agentChain;
+    }
+
     static removeLLMLoadProgressCallback(callback: InitProgressCallback) {
         const index = AgentChain.llmLoadProgressCallbacks.indexOf(callback);
         if (index !== -1) {
@@ -70,7 +110,7 @@ class AgentChain {
         }
     }
 
-    public model: ChatWebLLM;
+    public model: MagdaLlmModel;
     public loadProgress?: InitProgressReport;
     private loadProgressCallback?: InitProgressCallback;
     public chatHistory: BaseMessage[] = [];
@@ -101,17 +141,21 @@ class AgentChain {
         dataset: ParsedDataset | undefined,
         distribution: ParsedDistribution | undefined,
         loadProgressCallback?: InitProgressCallback,
-        options?: {
-            attachToWindowDebug?: boolean;
-            webLlmCreateOptions?: Partial<WebLLMInputs>;
-        }
+        options?: AgentChainCreateOptions
     ) {
         this.loadProgressCallback = loadProgressCallback;
         this.webLlmCreateOptions = options?.webLlmCreateOptions || {};
-        this.model = ChatWebLLM.createDefaultModel({
-            loadProgressCallback: this.onProgress.bind(this),
-            ...this.webLlmCreateOptions
-        });
+        if (options?.llmProvider === "openai") {
+            this.model = ChatEvalOpenAi.createDefaultModel({
+                loadProgressCallback: this.onProgress.bind(this),
+                ...options.openAi
+            });
+        } else {
+            this.model = ChatWebLLM.createDefaultModel({
+                loadProgressCallback: this.onProgress.bind(this),
+                ...this.webLlmCreateOptions
+            });
+        }
         this.appName = appName;
         this.navHistory = navHistory;
         this.navLocation = navLocation;
@@ -133,9 +177,16 @@ class AgentChain {
         modelConfig: Partial<WebLLMInputs>,
         errorHandler: (e) => void
     ) {
+        if (!(this.model instanceof ChatWebLLM)) {
+            errorHandler(
+                new Error("updateModelConfig applies to WebLLM only.")
+            );
+            return;
+        }
+        const webLlm = this.model;
         const modelSwitchRequested =
             typeof modelConfig.model === "string" &&
-            modelConfig.model !== this.model.model;
+            modelConfig.model !== webLlm.model;
         const needsNewEngineInstance =
             modelConfig.config !== undefined ||
             modelConfig.keepAliveMs !== undefined;
@@ -145,17 +196,17 @@ class AgentChain {
         // caches and makes weights look like they are downloading again.
         if (!modelSwitchRequested && !needsNewEngineInstance) {
             try {
-                const targetModelId = this.model.model;
+                const targetModelId = webLlm.model;
                 const mergedChatOptions = mergeWebLLMChatOptions(
-                    this.model.chatOptions,
+                    webLlm.chatOptions,
                     modelConfig.chatOptions
                 );
-                this.model.chatOptions = mergedChatOptions;
+                webLlm.chatOptions = mergedChatOptions;
                 if (modelConfig.temperature !== undefined) {
-                    this.model.temperature = modelConfig.temperature;
+                    webLlm.temperature = modelConfig.temperature;
                 }
                 if (modelConfig.loadProgressCallback !== undefined) {
-                    this.model.loadProgressCallback =
+                    webLlm.loadProgressCallback =
                         modelConfig.loadProgressCallback;
                 }
                 this.onProgress({
@@ -163,8 +214,8 @@ class AgentChain {
                     timeElapsed: 0,
                     text: "Updating context window (reusing loaded weights)..."
                 });
-                await this.model.getEngine();
-                await this.model.reload(targetModelId, mergedChatOptions);
+                await webLlm.getEngine();
+                await webLlm.reload(targetModelId, mergedChatOptions);
                 this.onProgress({
                     progress: 1,
                     timeElapsed: 0,
@@ -181,7 +232,7 @@ class AgentChain {
             timeElapsed: 0,
             text: "Unloading model in order to apply new model config..."
         });
-        this.model.getEngine().then((engine) => engine.unload());
+        webLlm.getEngine().then((engine) => engine.unload());
         this.model = ChatWebLLM.createDefaultModel({
             ...this.webLlmCreateOptions,
             ...modelConfig,
@@ -285,7 +336,8 @@ class AgentChain {
                 let buffer = "";
                 let partialMsgSent = false;
 
-                const stream = await (this.directModelAccess
+                const stream = await (this.directModelAccess &&
+                this.model instanceof ChatWebLLM
                     ? this.model.stream(input.question)
                     : this.chain.stream(input));
 

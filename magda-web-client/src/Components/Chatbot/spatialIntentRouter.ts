@@ -1,4 +1,5 @@
 import { ChainInput, SpatialCoverageHint, SpatialProfileItem } from "./commons";
+import { webLlmChatCompletion, webLlmResetChat } from "./webLlmSerial";
 
 /**
  * Hybrid GeoSQL intent router.
@@ -411,7 +412,7 @@ async function parseByLocalLlm(
     const sampleValues = collectSpatialSampleValues(input);
     try {
         const engine = await input.model.getEngine();
-        await engine.resetChat();
+        await webLlmResetChat(engine);
         const scopeBlock = input.spatialCoverage?.scopeHintForLlm
             ? `${input.spatialCoverage.scopeHintForLlm}\n\n`
             : "";
@@ -428,8 +429,7 @@ async function parseByLocalLlm(
             )}\n\n` +
             `Dataset metadata:\n${getDatasetMetadataSummary(input)}\n\n` +
             `Geometry types:\n${getGeometryTypeSummary(input) || "N/A"}`;
-        const reply = await engine.chat.completions.create({
-            stream: false,
+        const reply = await webLlmChatCompletion(engine, {
             messages: [
                 {
                     role: "system",

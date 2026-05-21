@@ -7,10 +7,20 @@ import React, {
 } from "react";
 import { Link, useHistory } from "react-router-dom";
 import { useDispatch, useSelector } from "react-redux";
-import { Button, ButtonToolbar, Input, Loader, Message, Panel } from "rsuite";
+import {
+    Button,
+    ButtonToolbar,
+    Input,
+    Loader,
+    Message,
+    Panel,
+    Radio,
+    RadioGroup
+} from "rsuite";
 import SelectPicker from "rsuite/SelectPicker";
 import MagdaNamespacesConsumer from "Components/i18n/MagdaNamespacesConsumer";
 import AgentChain from "./AgentChain";
+import { resolveEvalOpenAiDefaults } from "./ChatEvalOpenAi";
 import { fetchDatasetFromRegistry } from "actions/recordActions";
 import { StateType } from "reducers/reducer";
 import { ParsedDataset } from "helpers/record";
@@ -49,6 +59,48 @@ import {
 import reportError from "helpers/reportError";
 
 const LS_DATASET_IDS = "magdaGeoSqlEvalDatasetIds";
+const LS_LLM_PROVIDER = "magdaGeoSqlEvalLlmProvider";
+const LS_OPENAI_KEY = "magdaGeoSqlEvalOpenAiApiKey";
+const LS_OPENAI_BASE = "magdaGeoSqlEvalOpenAiBaseUrl";
+const LS_OPENAI_MODEL = "magdaGeoSqlEvalOpenAiModel";
+
+export type EvalLlmProvider = "webllm" | "openai";
+
+function loadEvalLlmProvider(): EvalLlmProvider {
+    try {
+        const v = localStorage.getItem(LS_LLM_PROVIDER);
+        return v === "openai" ? "openai" : "webllm";
+    } catch {
+        return "webllm";
+    }
+}
+
+function loadOpenAiEvalSettings(): {
+    apiKey: string;
+    baseUrl: string;
+    model: string;
+} {
+    const defaults = resolveEvalOpenAiDefaults();
+    try {
+        return {
+            apiKey: localStorage.getItem(LS_OPENAI_KEY) || "",
+            baseUrl: localStorage.getItem(LS_OPENAI_BASE) || defaults.baseUrl,
+            model: localStorage.getItem(LS_OPENAI_MODEL) || defaults.model
+        };
+    } catch {
+        return { apiKey: "", baseUrl: defaults.baseUrl, model: defaults.model };
+    }
+}
+
+function persistOpenAiEvalSettings(
+    apiKey: string,
+    baseUrl: string,
+    model: string
+) {
+    localStorage.setItem(LS_OPENAI_KEY, apiKey);
+    localStorage.setItem(LS_OPENAI_BASE, baseUrl.trim());
+    localStorage.setItem(LS_OPENAI_MODEL, model.trim());
+}
 
 type ManifestEntry = {
     title: string;
@@ -195,9 +247,24 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
     const [checkpoint, setCheckpoint] = useState<GeoSqlEvalCheckpoint | null>(
         () => loadEvalCheckpoint()
     );
+    const openAiDefaults = useMemo(() => resolveEvalOpenAiDefaults(), []);
+    const [llmProvider, setLlmProvider] = useState<EvalLlmProvider>(() =>
+        loadEvalLlmProvider()
+    );
+    const [openAiApiKey, setOpenAiApiKey] = useState("");
+    const [openAiBaseUrl, setOpenAiBaseUrl] = useState(openAiDefaults.baseUrl);
+    const [openAiModel, setOpenAiModel] = useState(openAiDefaults.model);
+
     const agentRef = useRef<AgentChain | null>(null);
     const cancelRef = useRef(false);
     const logEndRef = useRef<HTMLDivElement | null>(null);
+
+    useEffect(() => {
+        const s = loadOpenAiEvalSettings();
+        setOpenAiApiKey(s.apiKey);
+        setOpenAiBaseUrl(s.baseUrl);
+        setOpenAiModel(s.model);
+    }, []);
 
     const appendLog = useCallback(
         (message: string, level: HarnessLogLine["level"] = "info") => {
@@ -705,8 +772,14 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                 hash: "",
                 state: undefined
             } as any;
-            appendLog("Creating AgentChain and initializing WebLLM…", "info");
-            const agent = AgentChain.create(
+            const providerLabel =
+                llmProvider === "openai" ? "OpenAI API" : "WebLLM (local)";
+            appendLog(
+                `Creating AgentChain and initializing ${providerLabel}…`,
+                "info"
+            );
+            const progressTag = llmProvider === "openai" ? "OpenAI" : "WebLLM";
+            const agent = AgentChain.createForEval(
                 appName || "Magda",
                 fakeLocation,
                 history,
@@ -715,26 +788,46 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                 (r) => {
                     const t =
                         r.progress >= 1
-                            ? "WebLLM ready"
-                            : r.text || "Loading model…";
+                            ? `${progressTag} ready`
+                            : r.text || "Loading…";
                     setLlmProgress(t);
                     if (r.progress < 1 && r.text) {
-                        appendLog(`[WebLLM] ${r.text}`, "info");
+                        appendLog(`[${progressTag}] ${r.text}`, "info");
                     }
                 },
                 (e) =>
-                    reportError(`GeoSQL eval: WebLLM ${e}`, {
+                    reportError(`GeoSQL eval: ${providerLabel} ${e}`, {
                         duration: 8000
-                    })
+                    }),
+                llmProvider === "openai"
+                    ? {
+                          llmProvider: "openai",
+                          openAi: {
+                              apiKey:
+                                  openAiApiKey.trim() || openAiDefaults.apiKey,
+                              baseUrl: openAiBaseUrl.trim(),
+                              model: openAiModel.trim()
+                          }
+                      }
+                    : { llmProvider: "webllm" }
             );
             agentRef.current = agent;
             await agent.initialize((e) => {
                 throw e;
             });
-            appendLog("WebLLM initialization complete", "ok");
+            appendLog(`${providerLabel} initialization complete`, "ok");
             return agent;
         },
-        [appName, history, appendLog]
+        [
+            appName,
+            history,
+            appendLog,
+            llmProvider,
+            openAiApiKey,
+            openAiBaseUrl,
+            openAiModel,
+            openAiDefaults.apiKey
+        ]
     );
 
     const runEvalCore = useCallback(
@@ -756,6 +849,24 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                 );
                 return;
             }
+
+            if (llmProvider === "openai") {
+                const key = openAiApiKey.trim() || openAiDefaults.apiKey || "";
+                const base = openAiBaseUrl.trim() || openAiDefaults.baseUrl;
+                const needsKey = base.includes("api.openai.com");
+                if (needsKey && !key) {
+                    setRunError(
+                        "OpenAI: API key required for api.openai.com (field below or REACT_APP_OPENAI_API_KEY in .env.local)."
+                    );
+                    return;
+                }
+                persistOpenAiEvalSettings(
+                    openAiApiKey,
+                    openAiBaseUrl,
+                    openAiModel
+                );
+            }
+            localStorage.setItem(LS_LLM_PROVIDER, llmProvider);
 
             const runId = resumeCp?.runId || newRunId();
             const startedAt = resumeCp?.startedAt || new Date().toISOString();
@@ -956,7 +1067,12 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
             appendLog,
             ensureAgent,
             runOneDataset,
-            persistCheckpointState
+            persistCheckpointState,
+            llmProvider,
+            openAiApiKey,
+            openAiBaseUrl,
+            openAiModel,
+            openAiDefaults.apiKey
         ]
     );
 
@@ -1092,6 +1208,98 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                             </div>
                         ) : null}
                     </div>
+                </div>
+
+                <div
+                    style={{
+                        marginTop: 20,
+                        paddingTop: 16,
+                        borderTop: "1px solid #e5e5e5"
+                    }}
+                >
+                    <div style={{ marginBottom: 8, fontWeight: 600 }}>
+                        LLM backend (eval only)
+                    </div>
+                    <RadioGroup
+                        name="evalLlmProvider"
+                        value={llmProvider}
+                        onChange={(v) => {
+                            setLlmProvider(v as EvalLlmProvider);
+                            agentRef.current = null;
+                        }}
+                        disabled={running}
+                    >
+                        <Radio value="webllm">
+                            WebLLM — local browser model (Chrome extension)
+                        </Radio>
+                        <Radio value="openai">
+                            OpenAI API — Chat Completions (no extension)
+                        </Radio>
+                    </RadioGroup>
+                    {llmProvider === "openai" ? (
+                        <div
+                            style={{
+                                marginTop: 12,
+                                display: "grid",
+                                gap: 10,
+                                maxWidth: 640
+                            }}
+                        >
+                            <div>
+                                <div style={{ marginBottom: 4, fontSize: 13 }}>
+                                    API key (stored in localStorage for this
+                                    browser)
+                                </div>
+                                <Input
+                                    type="password"
+                                    value={openAiApiKey}
+                                    onChange={setOpenAiApiKey}
+                                    disabled={running}
+                                    placeholder={
+                                        openAiDefaults.apiKey
+                                            ? "Using REACT_APP_OPENAI_API_KEY from env"
+                                            : "sk-…"
+                                    }
+                                />
+                            </div>
+                            <div>
+                                <div style={{ marginBottom: 4, fontSize: 13 }}>
+                                    Base URL
+                                </div>
+                                <Input
+                                    value={openAiBaseUrl}
+                                    onChange={setOpenAiBaseUrl}
+                                    disabled={running}
+                                    placeholder={openAiDefaults.baseUrl}
+                                />
+                            </div>
+                            <div>
+                                <div style={{ marginBottom: 4, fontSize: 13 }}>
+                                    Model
+                                </div>
+                                <Input
+                                    value={openAiModel}
+                                    onChange={setOpenAiModel}
+                                    disabled={running}
+                                    placeholder={openAiDefaults.model}
+                                />
+                            </div>
+                            <p
+                                style={{
+                                    fontSize: 12,
+                                    color: "#666",
+                                    margin: 0
+                                }}
+                            >
+                                Env overrides:{" "}
+                                <code>REACT_APP_OPENAI_API_KEY</code>,{" "}
+                                <code>REACT_APP_OPENAI_BASE_URL</code>,{" "}
+                                <code>REACT_APP_OPENAI_MODEL</code>. Prefer a
+                                backend proxy in production so the key is not in
+                                the bundle.
+                            </p>
+                        </div>
+                    ) : null}
                 </div>
 
                 {datasetIsFetching ? (
