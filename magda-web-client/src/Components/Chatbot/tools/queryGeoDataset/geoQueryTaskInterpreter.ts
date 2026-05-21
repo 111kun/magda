@@ -1,4 +1,5 @@
 import type { ServiceWorkerMLCEngine } from "@mlc-ai/web-llm/lib/extension_service_worker";
+import { webLlmChatCompletion, webLlmResetChat } from "../../webLlmSerial";
 import type { GeoQueryScope } from "./scopeExtractor";
 
 /** High-level SQL intent — drives contracts and planner hints. */
@@ -877,7 +878,7 @@ export async function resolveGeoQueryTaskSpec(input: {
     }
     try {
         const engine = await input.getEngine();
-        await engine.resetChat();
+        await webLlmResetChat(engine);
         const deterministicJson = {
             target_pattern: baseSpec.plan.target_pattern,
             bindings_preview: baseSpec.plan.bindings,
@@ -914,8 +915,7 @@ export async function resolveGeoQueryTaskSpec(input: {
                 2
             )}`
         ].join("\n");
-        const reply = await engine.chat.completions.create({
-            stream: false,
+        const reply = await webLlmChatCompletion(engine, {
             messages: [
                 { role: "system", content: system },
                 { role: "user", content: user }

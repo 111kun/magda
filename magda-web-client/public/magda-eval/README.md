@@ -8,9 +8,9 @@
 magda-eval/
   README.md                 # 本文件
   cases/
-    land_zones.jsonl        # Land Development Zones，10 条
-    manningham_trees.jsonl  # Manningham Street Trees，10 条
-    road_segment.jsonl      # Road Segment，10 条
+    land_zones.jsonl        # Land Development Zones，24 条
+    manningham_trees.jsonl  # Manningham Street Trees，24 条
+    road_segment.jsonl      # Road Segment，24 条
   scripts/
     validate-cases.mjs      # 校验 JSONL 格式（无需安装依赖）
 ```
@@ -19,16 +19,30 @@ magda-eval/
 
 每行一个 JSON 对象，字段如下：
 
-| 字段                 | 必填 | 说明                                                                                                   |
-| -------------------- | ---- | ------------------------------------------------------------------------------------------------------ |
-| `id`                 | 是   | 稳定唯一 id，建议 `{dataset}-{序号}`。                                                                 |
-| `dataset_slug`       | 是   | `land_zones` \| `manningham_trees` \| `road_segment`。                                                 |
-| `distribution_index` | 否   | 数据集页上空间分发的索引；单空间文件时可省略，由工具自动选唯一分发。                                   |
-| `question`           | 是   | 自然语言问题（与真实用户提问风格一致）。                                                               |
-| `gold_sql`           | 是   | 针对表 **`features`** 的单条 `SELECT`/`WITH ... SELECT`；**固定 `ORDER BY` 与列别名**，便于结果 hash。 |
-| `tags`               | 否   | 题型标签，如 `count`、`group_by`、`geography_measure`。                                                |
+| 字段                 | 必填 | 说明                                                                                                                                                   |
+| -------------------- | ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `id`                 | 是   | 稳定唯一 id，建议 `{dataset}-{序号}`。                                                                                                                 |
+| `dataset_slug`       | 是   | `land_zones` \| `manningham_trees` \| `road_segment`。                                                                                                 |
+| `distribution_index` | 否   | 数据集页上空间分发的索引；单空间文件时可省略，由工具自动选唯一分发。                                                                                   |
+| `question`           | 是   | 自然语言问题（与真实用户提问风格一致）。                                                                                                               |
+| `gold_sql`           | 是   | 针对表 **`features`** 的单条 `SELECT`/`WITH ... SELECT`；**固定 `ORDER BY` 与列别名**，便于结果 hash。                                                 |
+| `tags`               | 否   | 题型标签：`ExecutionTargetPattern`（如 `FILTER_COUNT`）、难度 `L1`/`L2`/`L3`、结果形态 `scalar`/`rows`，以及辅助标签如 `filter`、`geography_measure`。 |
 
-运行前请将各数据集的 **Magda 数据集页 URL** 填入 `eval_data/data.md` 表格，并在自动化 runner 的配置中引用同一 URL（保证导入的 GeoJSON 与写 gold 时一致）。
+## 题型矩阵（每库 24 题）
+
+三库各 **24 条**（001–010 保留原 pilot；011–024 按 `ExecutionTargetPattern` × 难度扩充），共 **72 条**。
+
+| 槽位     | `target_pattern`     | L1                | L2                    | L3                                       |
+| -------- | -------------------- | ----------------- | --------------------- | ---------------------------------------- |
+| 计数     | `FILTER_COUNT`       | 全表 / 单字段 `=` | `ILIKE`、双字段 `AND` | 多条件 / 空串陷阱 / `DISTINCT` 计数      |
+| 分组     | `AGGREGATE_GROUP_BY` | —                 | Top-N 单维            | 过滤后分组 Top-N                         |
+| 列表     | `LIST_ROWS`          | 固定列 + `LIMIT`  | 带过滤 + 排序         | —                                        |
+| 量算     | `MEASUREMENT`        | —                 | 属性或 `ST_*` 聚合    | `::geography` 标量 / 极值                |
+| 空间过滤 | `SPATIAL_FILTER`     | 几何类型          | 阈值比较              | 子查询 vs 均值                           |
+| 最近邻   | `SPATIAL_NEAREST`    | —                 | —                     | Trees：`King`/`Str` 参考 + `ST_Distance` |
+| 复合     | `MIXED`              | —                 | 属性 + 空间谓词       | 子查询 / 数值范围                        |
+
+Land Zones 011–024 覆盖 `LIST_ROWS`、`SPATIAL_FILTER`、`MIXED` 等原 10 题未覆盖模式；Road 011–024 以 **`ST_Perimeter(geom::geography)`** 补充 MultiPolygon 周长量算（001–010 保留 `ST_Length` 约定）。
 
 ## 校验用例文件
 

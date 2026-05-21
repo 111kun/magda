@@ -16,17 +16,31 @@ import { StateType } from "reducers/reducer";
 import { ParsedDataset } from "helpers/record";
 import { config } from "config";
 import { runPostgisQuery } from "libs/pglitePostgis";
+import { fetchRecord } from "api-clients/RegistryApis";
 import {
     buildReport,
     classifySqlError,
+    downloadCombinedJsonReport,
     downloadCsvSummary,
     downloadJsonReport,
     EvalCaseRow,
     GeoSqlEvalReport,
-    compareQueryResults,
-    isReadableSql,
-    rowsToComparableSignature
+    isReadableSql
 } from "helpers/geoSqlEvalReport";
+import {
+    clearEvalCheckpoint,
+    EVAL_SLUG_ORDER,
+    EvalRunMode,
+    GeoSqlEvalCheckpoint,
+    loadEvalCheckpoint,
+    newRunId,
+    saveEvalCheckpoint
+} from "helpers/geoSqlEvalCheckpoint";
+import { parseDataset } from "helpers/record";
+import {
+    compareQueryResults,
+    rowsToComparableSignature
+} from "helpers/geoSqlEvalRowFingerprint";
 import {
     ChatEventMessage,
     EVENT_TYPE_ERROR,
@@ -133,6 +147,22 @@ async function collectStream(
     return { runLogs, streamError };
 }
 
+async function fetchCasesForSlug(slug: string): Promise<EvalCase[]> {
+    const file = caseFileForSlug(slug);
+    const res = await fetch(`/magda-eval/cases/${file}`);
+    if (!res.ok) throw new Error(`${file} HTTP ${res.status}`);
+    return parseJsonl(await res.text());
+}
+
+async function fetchParsedDataset(id: string) {
+    const raw = await fetchRecord(id);
+    const parsed = parseDataset(raw);
+    if (!parsed.identifier) {
+        throw new Error(`Dataset ${id} could not be parsed from registry.`);
+    }
+    return parsed;
+}
+
 const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
     const history = useHistory();
     const dispatch = useDispatch();
@@ -156,9 +186,17 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
     const [llmProgress, setLlmProgress] = useState<string | null>(null);
     const [runError, setRunError] = useState<string | null>(null);
     const [running, setRunning] = useState(false);
+    const [runMode, setRunMode] = useState<EvalRunMode | null>(null);
     const [lastReport, setLastReport] = useState<GeoSqlEvalReport | null>(null);
+    const [allReports, setAllReports] = useState<GeoSqlEvalReport[] | null>(
+        null
+    );
     const [harnessLog, setHarnessLog] = useState<HarnessLogLine[]>([]);
+    const [checkpoint, setCheckpoint] = useState<GeoSqlEvalCheckpoint | null>(
+        () => loadEvalCheckpoint()
+    );
     const agentRef = useRef<AgentChain | null>(null);
+    const cancelRef = useRef(false);
     const logEndRef = useRef<HTMLDivElement | null>(null);
 
     const appendLog = useCallback(
@@ -176,6 +214,16 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
     useEffect(() => {
         logEndRef.current?.scrollIntoView({ behavior: "smooth" });
     }, [harnessLog]);
+
+    useEffect(() => {
+        if (!running) return;
+        const onBeforeUnload = (e: BeforeUnloadEvent) => {
+            e.preventDefault();
+            e.returnValue = "";
+        };
+        window.addEventListener("beforeunload", onBeforeUnload);
+        return () => window.removeEventListener("beforeunload", onBeforeUnload);
+    }, [running]);
 
     useEffect(() => {
         let cancelled = false;
@@ -198,7 +246,7 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
             } catch (e) {
                 if (!cancelled) {
                     setManifestError(
-                        `无法加载 /magda-eval/manifest.json。请先执行 yarn sync-magda-eval。详情：${e}`
+                        `Failed to load /magda-eval/manifest.json. Run yarn sync-magda-eval first. ${e}`
                     );
                 }
             }
@@ -269,89 +317,72 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
 
     const clearLogs = useCallback(() => setHarnessLog([]), []);
 
-    const runEval = useCallback(async () => {
-        setRunError(null);
-        setLastReport(null);
-        setHarnessLog([]);
-        if (!config.enableChatbot || !config.enablePglitePostgis) {
-            setRunError(
-                "需要开启服务端配置 enableChatbot 与 enablePglitePostgis。"
-            );
-            return;
-        }
-        if (!effectiveDatasetId) {
-            setRunError("请填写 Magda 数据集 identifier。");
-            return;
-        }
-        if (!datasetReady || !dataset) {
-            setRunError("数据集尚未加载完成或 identifier 不匹配。");
-            return;
-        }
-        if (!cases?.length || !slug) {
-            setRunError("没有可用的评测用例（JSONL）。");
-            return;
-        }
+    const cancelRun = useCallback(() => {
+        cancelRef.current = true;
+        appendLog("Cancel requested — stopping after current step…", "warn");
+    }, [appendLog]);
 
-        appendLog("=== 开始评测（生产 AgentChain 全链路）===", "info");
-        appendLog(`数据集 slug: ${slug}`, "info");
-        appendLog(`Magda dataset id: ${effectiveDatasetId}`, "info");
-        appendLog(`用例数: ${cases.length}`, "info");
+    const discardCheckpoint = useCallback(() => {
+        clearEvalCheckpoint();
+        setCheckpoint(null);
+        appendLog("Checkpoint discarded.", "info");
+    }, [appendLog]);
 
-        const fakeLocation = {
-            pathname: `/dataset/${effectiveDatasetId}`,
-            search: "",
-            hash: "",
-            state: undefined
-        } as any;
+    const persistCheckpointState = useCallback((cp: GeoSqlEvalCheckpoint) => {
+        saveEvalCheckpoint(cp);
+        setCheckpoint(cp);
+    }, []);
 
-        appendLog("创建 AgentChain 并初始化 WebLLM…", "info");
-        const agent = AgentChain.create(
-            appName || "Magda",
-            fakeLocation,
-            history,
-            dataset,
-            undefined,
-            (r) => {
-                const t =
-                    r.progress >= 1 ? "WebLLM 就绪" : r.text || "加载模型…";
-                setLlmProgress(t);
-                if (r.progress < 1 && r.text) {
-                    appendLog(`[WebLLM] ${r.text}`, "info");
-                }
-            },
-            (e) => reportError(`GeoSQL eval: WebLLM ${e}`, { duration: 8000 })
-        );
-        agentRef.current = agent;
-        agent.setNavLocation(fakeLocation);
-        agent.setDataset(dataset);
+    const runOneDataset = useCallback(
+        async (params: {
+            targetSlug: string;
+            targetCases: EvalCase[];
+            targetDataset: ParsedDataset;
+            targetDatasetId: string;
+            agent: AgentChain;
+            mode: EvalRunMode;
+            runId: string;
+            startCaseIndex: number;
+            initialCaseRows: EvalCaseRow[];
+            completedSlugs: string[];
+            reportsBySlug: Record<string, GeoSqlEvalReport>;
+            harnessLogSnapshot: GeoSqlEvalReport["harness_log"];
+        }): Promise<GeoSqlEvalReport | null> => {
+            const {
+                targetSlug,
+                targetCases,
+                targetDataset,
+                targetDatasetId,
+                agent,
+                mode,
+                runId,
+                startCaseIndex,
+                initialCaseRows,
+                completedSlugs,
+                reportsBySlug,
+                harnessLogSnapshot
+            } = params;
 
-        try {
-            await agent.initialize((e) => {
-                throw e;
-            });
-        } catch (e) {
-            appendLog(`WebLLM 初始化失败: ${e}`, "error");
-            setRunError(`WebLLM 初始化失败：${e}`);
-            return;
-        }
-        appendLog("WebLLM 初始化完成", "ok");
+            const snapLog = (
+                message: string,
+                level: HarnessLogLine["level"] = "info"
+            ) => {
+                const at = new Date().toISOString();
+                harnessLogSnapshot.push({ at, level, message });
+                appendLog(message, level);
+            };
 
-        setRunning(true);
-        const caseRows: EvalCaseRow[] = [];
-        const harnessLogSnapshot: GeoSqlEvalReport["harness_log"] = [];
+            const fakeLocation = {
+                pathname: `/dataset/${targetDatasetId}`,
+                search: "",
+                hash: "",
+                state: undefined
+            } as any;
+            agent.setNavLocation(fakeLocation);
+            agent.setDataset(targetDataset);
 
-        const snapLog = (
-            message: string,
-            level: HarnessLogLine["level"] = "info"
-        ) => {
-            const at = new Date().toISOString();
-            harnessLogSnapshot.push({ at, level, message });
-            appendLog(message, level);
-        };
-
-        try {
             snapLog(
-                "阶段 1/3：warmupOnly（profile + 空间导入，跳过 LLM）",
+                `Phase 1/3: warmupOnly (profile + spatial import, no LLM) — ${targetSlug}`,
                 "info"
             );
             agent.clearDatasetProfileCache();
@@ -362,6 +393,10 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
             for (const line of warmupCollected.runLogs) {
                 snapLog(`[System] ${line}`, "info");
             }
+            if (cancelRef.current) {
+                snapLog("Run cancelled during warmup.", "warn");
+                return null;
+            }
             if (warmupCollected.streamError) {
                 throw new Error(warmupCollected.streamError);
             }
@@ -370,31 +405,218 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                 agent.keyContextData.datasetProfile?.spatial?.items || [];
             if (!spatialItems.length) {
                 throw new Error(
-                    "当前数据集无空间分发或 profile 未导入空间数据。"
+                    "No spatial distribution or profile import for this dataset."
                 );
             }
             snapLog(
-                `Warmup 完成：${spatialItems.length} 个空间 profile 项`,
+                `Warmup done: ${spatialItems.length} spatial profile item(s)`,
                 "ok"
             );
 
             snapLog(
-                "阶段 2/3：逐题 stream（spatial_sql → plan → execute → 捕获最终 SQL）",
+                "Phase 2/3: per-case stream (spatial_sql → plan → execute → capture final SQL)",
                 "info"
             );
 
-            for (let i = 0; i < cases.length; i++) {
-                const c = cases[i];
+            const caseRows: EvalCaseRow[] = [...initialCaseRows];
+
+            for (let i = startCaseIndex; i < targetCases.length; i++) {
+                if (cancelRef.current) {
+                    snapLog("Run cancelled.", "warn");
+                    persistCheckpointState({
+                        runId,
+                        mode,
+                        startedAt:
+                            checkpoint?.startedAt || new Date().toISOString(),
+                        updatedAt: new Date().toISOString(),
+                        slugs:
+                            mode === "all"
+                                ? [...EVAL_SLUG_ORDER]
+                                : [targetSlug],
+                        completedSlugs,
+                        currentSlug: targetSlug,
+                        currentCaseIndex: i,
+                        reports: reportsBySlug
+                    });
+                    return null;
+                }
+
+                const c = targetCases[i];
                 snapLog(
-                    `[${i + 1}/${cases.length}] ${
+                    `[${i + 1}/${targetCases.length}] ${
                         c.id
-                    } — 提问: ${c.question.slice(0, 80)}${
+                    } — Q: ${c.question.slice(0, 80)}${
                         c.question.length > 80 ? "…" : ""
                     }`,
                     "info"
                 );
 
-                if (c.dataset_slug !== slug) {
+                try {
+                    if (c.dataset_slug !== targetSlug) {
+                        caseRows.push({
+                            case_id: c.id,
+                            question: c.question,
+                            tags: c.tags,
+                            gold_sql: c.gold_sql,
+                            layer_a: {
+                                syntax_accuracy_first: false,
+                                syntax_accuracy_final: false,
+                                execution_pass_first: false,
+                                execution_pass_final: false,
+                                error_bucket_first: "routing",
+                                error_bucket_final: "routing",
+                                repair_gain: false
+                            },
+                            layer_b: {
+                                result_match: false,
+                                match_mode: "none",
+                                gold_fingerprint: "",
+                                model_fingerprint: "",
+                                gold_row_count: 0,
+                                model_row_count: 0
+                            },
+                            error_message: `dataset_slug mismatch (expected ${targetSlug})`
+                        });
+                        snapLog("  ✗ slug mismatch, skipped", "warn");
+                        continue;
+                    }
+
+                    const caseStream = await agent.stream(c.question, {
+                        geoEvalCaptureExecutedSql: true
+                    });
+                    const collected = await collectStream(caseStream);
+                    for (const line of collected.runLogs) {
+                        snapLog(`  [System] ${line}`, "info");
+                    }
+                    if (collected.streamError) {
+                        snapLog(
+                            `  Stream error: ${collected.streamError}`,
+                            "warn"
+                        );
+                    }
+
+                    const input = agent.lastEvalChainInput;
+                    const sqlFirst = input?.evalCapturedExecutedSqlFirst?.trim();
+                    const sqlFinal = input?.evalCapturedExecutedSql?.trim();
+                    const sanitizerFixes = input?.evalCapturedSanitizerFixes;
+
+                    const saFirst = isReadableSql(sqlFirst);
+                    const saFinal = isReadableSql(sqlFinal);
+                    const execFirst = await tryExecuteSql(sqlFirst);
+                    const execFinal = await tryExecuteSql(sqlFinal);
+                    const repairGain =
+                        !execFirst.ok && execFinal.ok && !!sqlFinal;
+
+                    let goldRows: Record<string, unknown>[] = [];
+                    let goldExecOk = false;
+                    let goldErr = "";
+                    try {
+                        goldRows = (await runPostgisQuery(
+                            c.gold_sql
+                        )) as Record<string, unknown>[];
+                        goldExecOk = true;
+                    } catch (e) {
+                        goldErr = String(e);
+                    }
+
+                    const goldFp = goldExecOk
+                        ? rowsToComparableSignature(goldRows)
+                        : "";
+                    let modelFp = "";
+                    let modelRowCount = 0;
+                    let resultMatch = false;
+                    let matchMode: EvalCaseRow["layer_b"]["match_mode"] =
+                        "none";
+
+                    if (execFinal.ok && execFinal.rows) {
+                        modelFp = rowsToComparableSignature(execFinal.rows);
+                        modelRowCount = execFinal.rows.length;
+                        if (goldExecOk) {
+                            const compared = compareQueryResults(
+                                goldRows,
+                                execFinal.rows
+                            );
+                            resultMatch = compared.match;
+                            matchMode = compared.mode;
+                        }
+                    }
+
+                    const errFirst = execFirst.error || collected.streamError;
+                    const errFinal = !sqlFinal
+                        ? "No final executed GeoSQL captured"
+                        : execFinal.error;
+
+                    const row: EvalCaseRow = {
+                        case_id: c.id,
+                        question: c.question,
+                        tags: c.tags,
+                        gold_sql: c.gold_sql,
+                        model_sql_first: sqlFirst,
+                        model_sql_final: sqlFinal,
+                        sanitizer_fixes: sanitizerFixes,
+                        layer_a: {
+                            syntax_accuracy_first: saFirst,
+                            syntax_accuracy_final: saFinal,
+                            execution_pass_first: execFirst.ok,
+                            execution_pass_final: execFinal.ok,
+                            error_bucket_first: execFirst.ok
+                                ? "none"
+                                : classifySqlError(errFirst || ""),
+                            error_bucket_final: execFinal.ok
+                                ? "none"
+                                : sqlFinal
+                                ? classifySqlError(errFinal || "")
+                                : "routing",
+                            repair_gain: repairGain
+                        },
+                        layer_b: {
+                            result_match: resultMatch,
+                            match_mode: matchMode,
+                            gold_fingerprint: goldFp,
+                            model_fingerprint: modelFp,
+                            gold_row_count: goldRows.length,
+                            model_row_count: modelRowCount
+                        },
+                        error_message:
+                            resultMatch || execFinal.ok
+                                ? undefined
+                                : errFinal || errFirst || goldErr,
+                        system_logs: collected.runLogs
+                    };
+                    caseRows.push(row);
+
+                    if (resultMatch) {
+                        snapLog(
+                            matchMode === "scalar"
+                                ? "  ✓ Layer B pass (scalar)"
+                                : "  ✓ Layer B pass (row set)",
+                            "ok"
+                        );
+                    } else if (!sqlFinal) {
+                        snapLog("  ✗ No final SQL captured", "error");
+                    } else if (!execFinal.ok) {
+                        snapLog(
+                            `  ✗ Layer A final exec failed (${row.layer_a.error_bucket_final})`,
+                            "error"
+                        );
+                    } else {
+                        snapLog(
+                            matchMode === "scalar"
+                                ? "  ✗ Layer B scalar mismatch"
+                                : "  ✗ Layer B row set mismatch",
+                            "warn"
+                        );
+                    }
+                    snapLog(
+                        `  Layer A: SA ${saFirst ? "✓" : "✗"}/${
+                            saFinal ? "✓" : "✗"
+                        } · EPR ${execFirst.ok ? "✓" : "✗"}/${
+                            execFinal.ok ? "✓" : "✗"
+                        }${repairGain ? " · repair+" : ""}`,
+                        "info"
+                    );
+                } catch (caseErr) {
+                    snapLog(`  ✗ Case error: ${caseErr}`, "error");
                     caseRows.push({
                         case_id: c.id,
                         question: c.question,
@@ -405,8 +627,8 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                             syntax_accuracy_final: false,
                             execution_pass_first: false,
                             execution_pass_final: false,
-                            error_bucket_first: "routing",
-                            error_bucket_final: "routing",
+                            error_bucket_first: "runtime",
+                            error_bucket_final: "runtime",
                             repair_gain: false
                         },
                         layer_b: {
@@ -417,193 +639,342 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                             gold_row_count: 0,
                             model_row_count: 0
                         },
-                        error_message: `dataset_slug 不匹配（期望 ${slug}）`
+                        error_message: String(caseErr)
                     });
-                    snapLog(`  ✗ slug 不匹配，跳过`, "warn");
-                    continue;
                 }
 
-                const caseStream = await agent.stream(c.question, {
-                    geoEvalCaptureExecutedSql: true
+                const partialReport = buildReport({
+                    slug: targetSlug,
+                    magdaDatasetId: targetDatasetId,
+                    datasetTitle: targetDataset.title,
+                    caseFile: caseFileForSlug(targetSlug),
+                    appName,
+                    cases: caseRows,
+                    harnessLog: harnessLogSnapshot
                 });
-                const collected = await collectStream(caseStream);
-                for (const line of collected.runLogs) {
-                    snapLog(`  [System] ${line}`, "info");
-                }
-                if (collected.streamError) {
-                    snapLog(`  流错误: ${collected.streamError}`, "warn");
-                }
-
-                const input = agent.lastEvalChainInput;
-                const sqlFirst = input?.evalCapturedExecutedSqlFirst?.trim();
-                const sqlFinal = input?.evalCapturedExecutedSql?.trim();
-                const sanitizerFixes = input?.evalCapturedSanitizerFixes;
-
-                const saFirst = isReadableSql(sqlFirst);
-                const saFinal = isReadableSql(sqlFinal);
-
-                const execFirst = await tryExecuteSql(sqlFirst);
-                const execFinal = await tryExecuteSql(sqlFinal);
-
-                const repairGain = !execFirst.ok && execFinal.ok && !!sqlFinal;
-
-                let goldRows: Record<string, unknown>[] = [];
-                let goldExecOk = false;
-                let goldErr = "";
-                try {
-                    goldRows = (await runPostgisQuery(c.gold_sql)) as Record<
-                        string,
-                        unknown
-                    >[];
-                    goldExecOk = true;
-                } catch (e) {
-                    goldErr = String(e);
-                }
-
-                const goldFp = goldExecOk
-                    ? rowsToComparableSignature(goldRows)
-                    : "";
-                let modelFp = "";
-                let modelRowCount = 0;
-                let resultMatch = false;
-                let matchMode: EvalCaseRow["layer_b"]["match_mode"] = "none";
-
-                if (execFinal.ok && execFinal.rows) {
-                    modelFp = rowsToComparableSignature(execFinal.rows);
-                    modelRowCount = execFinal.rows.length;
-                    if (goldExecOk) {
-                        const compared = compareQueryResults(
-                            goldRows,
-                            execFinal.rows
-                        );
-                        resultMatch = compared.match;
-                        matchMode = compared.mode;
-                    }
-                }
-
-                const errFirst = execFirst.error || collected.streamError;
-                const errFinal = !sqlFinal
-                    ? "未捕获最终执行的 GeoSQL"
-                    : execFinal.error;
-
-                const row: EvalCaseRow = {
-                    case_id: c.id,
-                    question: c.question,
-                    tags: c.tags,
-                    gold_sql: c.gold_sql,
-                    model_sql_first: sqlFirst,
-                    model_sql_final: sqlFinal,
-                    sanitizer_fixes: sanitizerFixes,
-                    layer_a: {
-                        syntax_accuracy_first: saFirst,
-                        syntax_accuracy_final: saFinal,
-                        execution_pass_first: execFirst.ok,
-                        execution_pass_final: execFinal.ok,
-                        error_bucket_first: execFirst.ok
-                            ? "none"
-                            : classifySqlError(errFirst || ""),
-                        error_bucket_final: execFinal.ok
-                            ? "none"
-                            : sqlFinal
-                            ? classifySqlError(errFinal || "")
-                            : "routing",
-                        repair_gain: repairGain
-                    },
-                    layer_b: {
-                        result_match: resultMatch,
-                        match_mode: matchMode,
-                        gold_fingerprint: goldFp,
-                        model_fingerprint: modelFp,
-                        gold_row_count: goldRows.length,
-                        model_row_count: modelRowCount
-                    },
-                    error_message:
-                        resultMatch || execFinal.ok
-                            ? undefined
-                            : errFinal || errFirst || goldErr,
-                    system_logs: collected.runLogs
-                };
-                caseRows.push(row);
-
-                if (resultMatch) {
-                    snapLog(
-                        matchMode === "scalar"
-                            ? `  ✓ Layer B 通过（标量数值一致）`
-                            : `  ✓ Layer B 通过（多行语义一致）`,
-                        "ok"
-                    );
-                } else if (!sqlFinal) {
-                    snapLog(`  ✗ 未捕获最终 SQL`, "error");
-                } else if (!execFinal.ok) {
-                    snapLog(
-                        `  ✗ Layer A 最终执行失败 (${row.layer_a.error_bucket_final})`,
-                        "error"
-                    );
-                } else {
-                    snapLog(
-                        matchMode === "scalar"
-                            ? `  ✗ Layer B 标量数值不一致`
-                            : `  ✗ Layer B 多行结果不一致`,
-                        "warn"
-                    );
-                }
-                snapLog(
-                    `  Layer A: SA ${saFirst ? "✓" : "✗"}/${
-                        saFinal ? "✓" : "✗"
-                    } · EPR ${execFirst.ok ? "✓" : "✗"}/${
-                        execFinal.ok ? "✓" : "✗"
-                    }${repairGain ? " · repair+" : ""}`,
-                    "info"
-                );
+                reportsBySlug[targetSlug] = partialReport;
+                persistCheckpointState({
+                    runId,
+                    mode,
+                    startedAt:
+                        checkpoint?.startedAt || new Date().toISOString(),
+                    updatedAt: new Date().toISOString(),
+                    slugs: mode === "all" ? [...EVAL_SLUG_ORDER] : [targetSlug],
+                    completedSlugs,
+                    currentSlug: targetSlug,
+                    currentCaseIndex: i + 1,
+                    reports: reportsBySlug
+                });
             }
 
-            snapLog("阶段 3/3：汇总 Layer A / Layer B 指标", "info");
+            snapLog("Phase 3/3: aggregate Layer A / Layer B", "info");
             const report = buildReport({
-                slug,
-                magdaDatasetId: effectiveDatasetId,
-                datasetTitle: dataset.title,
-                caseFile: caseFileForSlug(slug),
+                slug: targetSlug,
+                magdaDatasetId: targetDatasetId,
+                datasetTitle: targetDataset.title,
+                caseFile: caseFileForSlug(targetSlug),
                 appName,
                 cases: caseRows,
                 harnessLog: harnessLogSnapshot
             });
-            setLastReport(report);
+            reportsBySlug[targetSlug] = report;
 
             const s = report.summary;
             snapLog(
-                `完成 — Layer B 结果准确率 ${(
+                `Done ${targetSlug} — Layer B ${(
                     s.layer_b.result_accuracy * 100
                 ).toFixed(1)}% (${s.layer_b.result_match_count}/${s.n})`,
                 "ok"
             );
-            snapLog(
-                `Layer A — SA(first/final) ${(
-                    s.layer_a.syntax_accuracy_first * 100
-                ).toFixed(1)}% / ${(
-                    s.layer_a.syntax_accuracy_final * 100
-                ).toFixed(1)}% · EPR ${(s.layer_a.epr_first * 100).toFixed(
-                    1
-                )}% / ${(s.layer_a.epr_final * 100).toFixed(
-                    1
-                )}% · repair gain ${s.layer_a.repair_gain_count}`,
-                "ok"
+            return report;
+        },
+        [appName, appendLog, checkpoint?.startedAt, persistCheckpointState]
+    );
+
+    const ensureAgent = useCallback(
+        async (
+            initialDataset: ParsedDataset,
+            datasetId: string
+        ): Promise<AgentChain> => {
+            if (agentRef.current) {
+                return agentRef.current;
+            }
+            const fakeLocation = {
+                pathname: `/dataset/${datasetId}`,
+                search: "",
+                hash: "",
+                state: undefined
+            } as any;
+            appendLog("Creating AgentChain and initializing WebLLM…", "info");
+            const agent = AgentChain.create(
+                appName || "Magda",
+                fakeLocation,
+                history,
+                initialDataset,
+                undefined,
+                (r) => {
+                    const t =
+                        r.progress >= 1
+                            ? "WebLLM ready"
+                            : r.text || "Loading model…";
+                    setLlmProgress(t);
+                    if (r.progress < 1 && r.text) {
+                        appendLog(`[WebLLM] ${r.text}`, "info");
+                    }
+                },
+                (e) =>
+                    reportError(`GeoSQL eval: WebLLM ${e}`, {
+                        duration: 8000
+                    })
             );
-        } catch (e) {
-            appendLog(`评测中止: ${e}`, "error");
-            setRunError(String(e));
-        } finally {
-            setRunning(false);
-        }
-    }, [
-        appName,
-        history,
-        dataset,
-        datasetReady,
-        cases,
-        slug,
-        effectiveDatasetId,
-        appendLog
+            agentRef.current = agent;
+            await agent.initialize((e) => {
+                throw e;
+            });
+            appendLog("WebLLM initialization complete", "ok");
+            return agent;
+        },
+        [appName, history, appendLog]
+    );
+
+    const runEvalCore = useCallback(
+        async (mode: EvalRunMode, resumeCp?: GeoSqlEvalCheckpoint | null) => {
+            setRunError(null);
+            setAllReports(null);
+            if (!resumeCp) {
+                setLastReport(null);
+                setHarnessLog([]);
+            }
+            cancelRef.current = false;
+            if (!resumeCp) {
+                agentRef.current = null;
+            }
+
+            if (!config.enableChatbot || !config.enablePglitePostgis) {
+                setRunError(
+                    "Server must enable enableChatbot and enablePglitePostgis."
+                );
+                return;
+            }
+
+            const runId = resumeCp?.runId || newRunId();
+            const startedAt = resumeCp?.startedAt || new Date().toISOString();
+            const reportsBySlug: Record<string, GeoSqlEvalReport> = {
+                ...(resumeCp?.reports || {})
+            };
+            const completedSlugs = [...(resumeCp?.completedSlugs || [])];
+            const harnessLogSnapshot: GeoSqlEvalReport["harness_log"] = [];
+
+            const slugsToRun =
+                mode === "all"
+                    ? EVAL_SLUG_ORDER.filter((s) => manifest?.[s])
+                    : slug
+                    ? [slug]
+                    : [];
+
+            if (!slugsToRun.length) {
+                setRunError("No dataset slug selected.");
+                return;
+            }
+
+            setRunning(true);
+            setRunMode(mode);
+
+            try {
+                appendLog(
+                    resumeCp
+                        ? `=== Resuming eval (${mode}) run ${runId} ===`
+                        : `=== Starting eval (${mode}) — production AgentChain ===`,
+                    "info"
+                );
+                if (mode === "all") {
+                    appendLog(
+                        `All datasets (${slugsToRun.length}): ${slugsToRun.join(
+                            ", "
+                        )}`,
+                        "info"
+                    );
+                }
+
+                let agent: AgentChain | null = null;
+
+                for (const targetSlug of slugsToRun) {
+                    if (cancelRef.current) break;
+                    if (completedSlugs.includes(targetSlug)) {
+                        appendLog(
+                            `Skipping completed dataset: ${targetSlug}`,
+                            "info"
+                        );
+                        continue;
+                    }
+
+                    const overrides = loadIdOverrides();
+                    const targetDatasetId = (
+                        overrides[targetSlug] ||
+                        manifest?.[targetSlug]?.magda_dataset_id ||
+                        ""
+                    ).trim();
+                    if (!targetDatasetId) {
+                        throw new Error(
+                            `Missing Magda dataset id for slug "${targetSlug}".`
+                        );
+                    }
+
+                    if (mode === "single") {
+                        setSlug(targetSlug);
+                        setDatasetIdInput(targetDatasetId);
+                    }
+
+                    appendLog(
+                        `Loading dataset ${targetSlug} (${targetDatasetId})…`,
+                        "info"
+                    );
+                    dispatch(fetchDatasetFromRegistry(targetDatasetId) as any);
+                    const targetDataset = await fetchParsedDataset(
+                        targetDatasetId
+                    );
+                    const targetCases = await fetchCasesForSlug(targetSlug);
+                    appendLog(
+                        `Loaded ${targetCases.length} case(s) for ${targetSlug}`,
+                        "info"
+                    );
+
+                    if (!agent) {
+                        agent = await ensureAgent(
+                            targetDataset,
+                            targetDatasetId
+                        );
+                    }
+
+                    const resumeThisSlug =
+                        resumeCp?.currentSlug === targetSlug &&
+                        resumeCp.currentCaseIndex > 0;
+                    const startCaseIndex = resumeThisSlug
+                        ? resumeCp!.currentCaseIndex
+                        : 0;
+                    const initialCaseRows = resumeThisSlug
+                        ? [...(reportsBySlug[targetSlug]?.cases || [])]
+                        : [];
+
+                    if (resumeThisSlug) {
+                        appendLog(
+                            `Resuming ${targetSlug} from case ${
+                                startCaseIndex + 1
+                            }`,
+                            "info"
+                        );
+                    }
+
+                    const report = await runOneDataset({
+                        targetSlug,
+                        targetCases,
+                        targetDataset,
+                        targetDatasetId,
+                        agent,
+                        mode,
+                        runId,
+                        startCaseIndex,
+                        initialCaseRows,
+                        completedSlugs,
+                        reportsBySlug,
+                        harnessLogSnapshot
+                    });
+
+                    if (!report || cancelRef.current) {
+                        appendLog(
+                            "Run stopped — partial results saved to checkpoint (localStorage). Use Resume to continue.",
+                            "warn"
+                        );
+                        break;
+                    }
+
+                    completedSlugs.push(targetSlug);
+                    persistCheckpointState({
+                        runId,
+                        mode,
+                        startedAt,
+                        updatedAt: new Date().toISOString(),
+                        slugs: [...slugsToRun],
+                        completedSlugs,
+                        currentSlug: null,
+                        currentCaseIndex: 0,
+                        reports: reportsBySlug
+                    });
+
+                    if (mode === "single") {
+                        setLastReport(report);
+                        setCases(targetCases);
+                    }
+                }
+
+                const finishedReports = slugsToRun
+                    .map((s) => reportsBySlug[s])
+                    .filter(Boolean) as GeoSqlEvalReport[];
+
+                if (mode === "all" && finishedReports.length) {
+                    setAllReports(finishedReports);
+                    setLastReport(finishedReports[finishedReports.length - 1]);
+                    const totalN = finishedReports.reduce(
+                        (a, r) => a + r.summary.n,
+                        0
+                    );
+                    const totalMatch = finishedReports.reduce(
+                        (a, r) => a + r.summary.layer_b.result_match_count,
+                        0
+                    );
+                    appendLog(
+                        `All datasets finished — Layer B ${totalMatch}/${totalN} cases matched overall`,
+                        "ok"
+                    );
+                }
+
+                if (
+                    !cancelRef.current &&
+                    completedSlugs.length === slugsToRun.length
+                ) {
+                    clearEvalCheckpoint();
+                    setCheckpoint(null);
+                    appendLog("Checkpoint cleared (run completed).", "ok");
+                }
+            } catch (e) {
+                appendLog(`Eval aborted: ${e}`, "error");
+                setRunError(String(e));
+                appendLog(
+                    "Partial progress may be in checkpoint — use Resume after fixing the issue.",
+                    "warn"
+                );
+            } finally {
+                setRunning(false);
+                setRunMode(null);
+                setLlmProgress(null);
+            }
+        },
+        [
+            slug,
+            manifest,
+            dispatch,
+            appendLog,
+            ensureAgent,
+            runOneDataset,
+            persistCheckpointState
+        ]
+    );
+
+    const runEval = useCallback(() => runEvalCore("single", null), [
+        runEvalCore
     ]);
+
+    const runAllEval = useCallback(() => runEvalCore("all", null), [
+        runEvalCore
+    ]);
+
+    const resumeEval = useCallback(() => {
+        const cp = loadEvalCheckpoint();
+        if (!cp) return;
+        setCheckpoint(cp);
+        if (cp.currentSlug) setSlug(cp.currentSlug);
+        void runEvalCore(cp.mode, cp);
+    }, [runEvalCore]);
 
     const passCount = lastReport?.summary.layer_b.result_match_count ?? 0;
     const totalCount = lastReport?.summary.n ?? 0;
@@ -621,17 +992,28 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
         }
     };
 
+    const canRun =
+        config.enableChatbot &&
+        config.enablePglitePostgis &&
+        !running &&
+        manifest;
+
     return (
         <div className="container" style={{ padding: "24px 16px 48px" }}>
-            <h2>Magda GeoSQL 评测（全链路）</h2>
+            <h2>Magda GeoSQL evaluation (full pipeline)</h2>
             <p style={{ maxWidth: 920 }}>
-                对齐终稿 <strong>§4.3 两层评测</strong>：
-                <strong>Layer A</strong>{" "}
-                语法可读性（SA）与执行通过率（EPR，首次/最终）；
-                <strong>Layer B</strong> 与 <code>gold_sql</code>{" "}
-                的结果指纹比对。走 <code>AgentChain</code> →{" "}
-                <code>spatial_sql</code> → <code>queryGeoDataset</code>{" "}
-                生产路径。
+                <strong>Layer A</strong> — syntax accuracy (SA) and execution
+                pass rate (EPR, first/final); <strong>Layer B</strong> —
+                semantic match vs <code>gold_sql</code>. Uses production path{" "}
+                <code>AgentChain</code> → <code>spatial_sql</code> →{" "}
+                <code>queryGeoDataset</code>.
+            </p>
+            <p style={{ maxWidth: 920, fontSize: 13, color: "#555" }}>
+                <strong>Resilience:</strong> progress is checkpointed to{" "}
+                <code>localStorage</code> after each case (resume after refresh
+                or crash). Closing the tab while running triggers a browser
+                warning. Use <strong>Cancel</strong> to stop gracefully; partial
+                reports remain downloadable.
             </p>
 
             {manifestError ? (
@@ -642,14 +1024,41 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
 
             {!config.enableChatbot || !config.enablePglitePostgis ? (
                 <Message type="warning" showIcon>
-                    当前环境未开启 enableChatbot 或 enablePglitePostgis。
+                    This deployment does not have enableChatbot or
+                    enablePglitePostgis enabled.
+                </Message>
+            ) : null}
+
+            {checkpoint && !running ? (
+                <Message type="info" showIcon style={{ marginTop: 12 }}>
+                    Saved checkpoint ({checkpoint.mode}):{" "}
+                    {checkpoint.completedSlugs.length} /{" "}
+                    {checkpoint.slugs.length} dataset(s) done
+                    {checkpoint.currentSlug
+                        ? ` — resume at ${checkpoint.currentSlug} case ${
+                              checkpoint.currentCaseIndex + 1
+                          }`
+                        : ""}
+                    .
+                    <ButtonToolbar style={{ marginTop: 8 }}>
+                        <Button
+                            size="sm"
+                            appearance="primary"
+                            onClick={() => void resumeEval()}
+                        >
+                            Resume
+                        </Button>
+                        <Button size="sm" onClick={discardCheckpoint}>
+                            Discard checkpoint
+                        </Button>
+                    </ButtonToolbar>
                 </Message>
             ) : null}
 
             <Panel bordered style={{ marginTop: 16 }}>
                 <div style={{ display: "flex", flexWrap: "wrap", gap: 16 }}>
                     <div style={{ minWidth: 260 }}>
-                        <div style={{ marginBottom: 8 }}>评测数据集</div>
+                        <div style={{ marginBottom: 8 }}>Eval dataset</div>
                         <SelectPicker
                             data={pickerData}
                             value={slug}
@@ -669,7 +1078,7 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                             onChange={setDatasetIdInput}
                             onBlur={persistDatasetId}
                             disabled={running}
-                            placeholder="与 /dataset/&lt;id&gt; 相同"
+                            placeholder="Same as /dataset/&lt;id&gt;"
                         />
                         {effectiveDatasetId ? (
                             <div style={{ marginTop: 8 }}>
@@ -678,7 +1087,7 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                                     target="_blank"
                                     rel="noreferrer"
                                 >
-                                    打开数据集页
+                                    Open dataset page
                                 </Link>
                             </div>
                         ) : null}
@@ -686,7 +1095,7 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                 </div>
 
                 {datasetIsFetching ? (
-                    <Loader content="加载 registry 数据集…" />
+                    <Loader content="Loading dataset from registry…" />
                 ) : null}
                 {datasetFetchError ? (
                     <Message type="error" style={{ marginTop: 12 }} showIcon>
@@ -702,11 +1111,11 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                 ) : null}
                 {datasetReady ? (
                     <Message type="success" style={{ marginTop: 12 }} showIcon>
-                        已加载：{dataset?.title}
+                        Loaded: {dataset?.title}
                     </Message>
                 ) : effectiveDatasetId && !datasetIsFetching ? (
                     <Message type="info" style={{ marginTop: 12 }} showIcon>
-                        等待 registry 数据集…
+                        Waiting for registry dataset…
                     </Message>
                 ) : null}
 
@@ -716,7 +1125,14 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                     </Message>
                 ) : cases ? (
                     <Message type="info" style={{ marginTop: 12 }} showIcon>
-                        已载入 {cases.length} 条用例（{slug}）。
+                        {cases.length} case(s) loaded ({slug}).
+                    </Message>
+                ) : null}
+
+                {running && runMode === "all" ? (
+                    <Message type="info" style={{ marginTop: 12 }} showIcon>
+                        Running all three datasets sequentially — do not close
+                        this tab. Progress is saved after each case.
                     </Message>
                 ) : null}
 
@@ -735,20 +1151,32 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                 <ButtonToolbar style={{ marginTop: 16 }}>
                     <Button
                         appearance="primary"
-                        loading={running}
+                        loading={running && runMode === "single"}
                         disabled={
                             running ||
                             !datasetReady ||
                             !cases?.length ||
-                            !config.enableChatbot ||
-                            !config.enablePglitePostgis
+                            !canRun
                         }
                         onClick={() => void runEval()}
                     >
-                        运行评测
+                        Run current dataset
                     </Button>
+                    <Button
+                        appearance="ghost"
+                        loading={running && runMode === "all"}
+                        disabled={!canRun}
+                        onClick={() => void runAllEval()}
+                    >
+                        Run all 3 datasets
+                    </Button>
+                    {running ? (
+                        <Button color="red" onClick={cancelRun}>
+                            Cancel
+                        </Button>
+                    ) : null}
                     <Button disabled={running} onClick={clearLogs}>
-                        清空日志
+                        Clear log
                     </Button>
                     <Button
                         disabled={!lastReport}
@@ -756,7 +1184,7 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                             lastReport && downloadJsonReport(lastReport)
                         }
                     >
-                        下载 JSON 报告
+                        Download JSON
                     </Button>
                     <Button
                         disabled={!lastReport}
@@ -764,13 +1192,21 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                             lastReport && downloadCsvSummary(lastReport)
                         }
                     >
-                        下载 CSV 摘要
+                        Download CSV summary
+                    </Button>
+                    <Button
+                        disabled={!allReports?.length}
+                        onClick={() =>
+                            allReports && downloadCombinedJsonReport(allReports)
+                        }
+                    >
+                        Download combined JSON
                     </Button>
                 </ButtonToolbar>
             </Panel>
 
             <Panel
-                header="运行日志（harness + System Logs）"
+                header="Run log (harness + system logs)"
                 bordered
                 style={{ marginTop: 16 }}
             >
@@ -790,8 +1226,8 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                 >
                     {harnessLog.length === 0 ? (
                         <div style={{ color: "#888" }}>
-                            点击「运行评测」后在此显示阶段进度；每条用例会附带
-                            AgentChain System Logs。
+                            Start a run to see phase progress here. Each case
+                            includes AgentChain system logs.
                         </div>
                     ) : (
                         harnessLog.map((line, idx) => (
@@ -813,9 +1249,56 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                 </div>
             </Panel>
 
+            {allReports && allReports.length > 1 ? (
+                <Panel
+                    header="All-datasets summary"
+                    bordered
+                    style={{ marginTop: 16 }}
+                >
+                    <table className="table">
+                        <thead>
+                            <tr>
+                                <th>Dataset</th>
+                                <th>Cases</th>
+                                <th>Layer B</th>
+                                <th>EPR (final)</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {allReports.map((r) => (
+                                <tr key={r.meta.dataset_slug}>
+                                    <td>
+                                        <code>{r.meta.dataset_slug}</code>
+                                        <div style={{ fontSize: 11 }}>
+                                            {r.meta.dataset_title}
+                                        </div>
+                                    </td>
+                                    <td>{r.summary.n}</td>
+                                    <td>
+                                        {r.summary.layer_b.result_match_count}/
+                                        {r.summary.n} (
+                                        {(
+                                            r.summary.layer_b.result_accuracy *
+                                            100
+                                        ).toFixed(1)}
+                                        %)
+                                    </td>
+                                    <td>
+                                        {(
+                                            r.summary.layer_a.epr_final * 100
+                                        ).toFixed(1)}
+                                        %
+                                    </td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
+                </Panel>
+            ) : null}
+
             {lastReport ? (
                 <Panel
-                    header={`评测结果 — Layer B ${passCount} / ${totalCount} 通过`}
+                    header={`Results — Layer B ${passCount} / ${totalCount} passed (${lastReport.meta.dataset_slug})`}
                     bordered
                     style={{ marginTop: 16 }}
                 >
@@ -866,10 +1349,11 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                         <div>
                             <strong>Repair gain</strong>
                             <br />
-                            {lastReport.summary.layer_a.repair_gain_count} 条
+                            {lastReport.summary.layer_a.repair_gain_count}{" "}
+                            case(s)
                         </div>
                         <div>
-                            <strong>Layer B · 结果准确率</strong>
+                            <strong>Layer B · result accuracy</strong>
                             <br />
                             {(
                                 lastReport.summary.layer_b.result_accuracy * 100
@@ -882,10 +1366,10 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                         <table className="table">
                             <thead>
                                 <tr>
-                                    <th>用例</th>
+                                    <th>Case</th>
                                     <th>Layer B</th>
-                                    <th>EPR 首/终</th>
-                                    <th>说明</th>
+                                    <th>EPR first/final</th>
+                                    <th>Notes</th>
                                 </tr>
                             </thead>
                             <tbody>
@@ -924,10 +1408,10 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                                                     )}
                                                 </span>
                                             ) : r.layer_b.result_match ? (
-                                                "指纹一致"
+                                                "Match"
                                             ) : (
                                                 <details>
-                                                    <summary>模型 SQL</summary>
+                                                    <summary>Model SQL</summary>
                                                     <pre
                                                         style={{
                                                             whiteSpace:

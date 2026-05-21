@@ -197,6 +197,34 @@ export function buildReport(params: {
     };
 }
 
+export type GeoSqlEvalCombinedReport = {
+    meta: {
+        framework: string;
+        generated_at: string;
+        mode: "all_datasets";
+        dataset_count: number;
+    };
+    datasets: GeoSqlEvalReport[];
+};
+
+export function downloadCombinedJsonReport(reports: GeoSqlEvalReport[]): void {
+    const ts = new Date().toISOString().replace(/[:.]/g, "-");
+    const combined: GeoSqlEvalCombinedReport = {
+        meta: {
+            framework:
+                "GeoSQL-Eval two-layer — combined run (Layer A: SA/EPR; Layer B: semantic match)",
+            generated_at: new Date().toISOString(),
+            mode: "all_datasets",
+            dataset_count: reports.length
+        },
+        datasets: reports
+    };
+    const blob = new Blob([JSON.stringify(combined, null, 2)], {
+        type: "application/json"
+    });
+    triggerDownload(blob, `magda-geosql-eval-all-${ts}.json`);
+}
+
 export function downloadJsonReport(report: GeoSqlEvalReport): void {
     const slug = report.meta.dataset_slug || "eval";
     const ts = report.meta.generated_at.replace(/[:.]/g, "-");

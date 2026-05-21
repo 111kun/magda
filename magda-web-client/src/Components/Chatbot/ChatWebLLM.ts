@@ -15,6 +15,10 @@ import type {
     ServiceWorkerMLCEngine
 } from "@mlc-ai/web-llm/lib/extension_service_worker";
 import { config } from "../../config";
+import {
+    webLlmChatCompletion,
+    webLlmChatCompletionStream
+} from "./webLlmSerial";
 
 const defaultExtensionId = config.llmExtensionId;
 const defaultKeepAliveMs = 10000;
@@ -296,8 +300,7 @@ export default class ChatWebLLM extends SimpleChatModel<WebLLMCallOptions> {
         );
 
         const engine = await this.getEngine();
-        const stream = await engine.chat.completions.create({
-            stream: true,
+        const stream = await webLlmChatCompletionStream(engine, {
             messages: messagesInput,
             stop: options.stop,
             logprobs: true
@@ -430,7 +433,7 @@ export default class ChatWebLLM extends SimpleChatModel<WebLLMCallOptions> {
         const engine = await this.getEngine();
         let reply: webllm.ChatCompletion | undefined;
         try {
-            reply = await engine.chat.completions.create(request);
+            reply = await webLlmChatCompletion(engine, request);
         } catch (e) {
             const msg = String(e || "");
             // Some models may output plain assistant text in tool-call mode,

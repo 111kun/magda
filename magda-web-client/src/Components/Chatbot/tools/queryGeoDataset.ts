@@ -28,6 +28,7 @@ import {
     runPostgisQuery
 } from "../../../libs/pglitePostgis";
 import { WebLLMTool } from "../ChatWebLLM";
+import { webLlmChatCompletion, webLlmResetChat } from "../webLlmSerial";
 import { markdownTable } from "markdown-table";
 import { ParsedDistribution } from "helpers/record";
 import { config } from "../../../config";
@@ -405,10 +406,9 @@ async function generateGeoDatasetIntro(
     try {
         const engine = await input.model.getEngine();
         console.log("[generateGeoDatasetIntro] resetChat before intro LLM…");
-        await engine.resetChat();
+        await webLlmResetChat(engine);
         console.log("[generateGeoDatasetIntro] resetChat done.");
-        const reply = await engine.chat.completions.create({
-            stream: false,
+        const reply = await webLlmChatCompletion(engine, {
             messages: [
                 {
                     role: "system",
@@ -446,7 +446,7 @@ export async function planGeoSqlQuery(
 ): Promise<GeoSqlPlan> {
     const engine = await this.model.getEngine();
     console.log("[planGeoSqlQuery] calling engine.resetChat() before planner…");
-    await engine.resetChat();
+    await webLlmResetChat(engine);
     console.log("[planGeoSqlQuery] engine.resetChat() completed.");
     const schemaContextLabel =
         "Dataset information (authoritative schema + sample values for SQL key/value grounding)";
@@ -632,13 +632,10 @@ export async function planGeoSqlQuery(
         `Calling WebLLM for GeoSQL JSON plan (non-streaming; ~${totalTokenEst} prompt tokens estimated)…`
     );
     const PLANNER_TIMEOUT_MS = 5 * 60 * 1000;
-    let reply: Awaited<
-        ReturnType<typeof engine.chat.completions.create>
-    > | null = null;
+    let reply: Awaited<ReturnType<typeof webLlmChatCompletion>> | null = null;
     try {
         reply = await Promise.race([
-            engine.chat.completions.create({
-                stream: false,
+            webLlmChatCompletion(engine, {
                 messages: [
                     {
                         role: "system",

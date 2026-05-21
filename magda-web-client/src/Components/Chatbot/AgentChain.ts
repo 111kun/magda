@@ -4,6 +4,7 @@ import { InitProgressCallback, InitProgressReport } from "@mlc-ai/web-llm";
 import { BaseMessage, AIMessage } from "@langchain/core/messages";
 import { Runnable, RunnableLambda } from "@langchain/core/runnables";
 import ChatWebLLM, { mergeWebLLMChatOptions, WebLLMInputs } from "./ChatWebLLM";
+import { webLlmResetChat } from "./webLlmSerial";
 import AsyncQueue from "@ai-zen/async-queue";
 import {
     CommonInputType,
@@ -333,7 +334,7 @@ class AgentChain {
                         "[AgentChain.stream] finally: calling resetChat…"
                     );
                     const eng = await this.model.getEngine();
-                    await eng.resetChat();
+                    await webLlmResetChat(eng);
                     console.log(
                         "[AgentChain.stream] finally: resetChat completed."
                     );
