@@ -41,6 +41,9 @@ import {
     formatDurationMs,
     parseLlmUsageFromSystemLogs
 } from "helpers/geoSqlEvalMetrics";
+import { generateBaselineDirectSql } from "helpers/geoSqlBaselineDirect";
+import { buildGeoFileDescriptionsAndIntro } from "./tools/queryGeoDataset/description";
+import { isGeoSpatialDistribution } from "./tools/queryGeoDataset/distribution";
 import {
     clearEvalCheckpoint,
     EVAL_SLUG_ORDER,
@@ -67,8 +70,26 @@ const LS_LLM_PROVIDER = "magdaGeoSqlEvalLlmProvider";
 const LS_OPENAI_KEY = "magdaGeoSqlEvalOpenAiApiKey";
 const LS_OPENAI_BASE = "magdaGeoSqlEvalOpenAiBaseUrl";
 const LS_OPENAI_MODEL = "magdaGeoSqlEvalOpenAiModel";
+const LS_EVAL_PIPELINE = "magdaGeoSqlEvalPipeline";
 
 export type EvalLlmProvider = "webllm" | "openai";
+export type EvalPipelineMode = "agent" | "baseline_direct";
+
+function loadEvalPipeline(): EvalPipelineMode {
+    try {
+        return localStorage.getItem(LS_EVAL_PIPELINE) === "baseline_direct"
+            ? "baseline_direct"
+            : "agent";
+    } catch {
+        return "agent";
+    }
+}
+
+function geoDistItems(dataset: ParsedDataset) {
+    return (dataset.distributions || [])
+        .map((dist, idx) => ({ idx, dist }))
+        .filter((item) => isGeoSpatialDistribution(item.dist));
+}
 
 function loadEvalLlmProvider(): EvalLlmProvider {
     try {
@@ -254,6 +275,9 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
     const openAiDefaults = useMemo(() => resolveEvalOpenAiDefaults(), []);
     const [llmProvider, setLlmProvider] = useState<EvalLlmProvider>(() =>
         loadEvalLlmProvider()
+    );
+    const [evalPipeline, setEvalPipeline] = useState<EvalPipelineMode>(() =>
+        loadEvalPipeline()
     );
     const [openAiApiKey, setOpenAiApiKey] = useState("");
     const [openAiBaseUrl, setOpenAiBaseUrl] = useState(openAiDefaults.baseUrl);
@@ -492,12 +516,36 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                 "ok"
             );
 
+            let baselinePrepared: {
+                metadataBrief: string;
+                fileDescItems: string[];
+            } | null = null;
+            if (evalPipeline === "baseline_direct") {
+                const distItems = geoDistItems(targetDataset);
+                baselinePrepared = await buildGeoFileDescriptionsAndIntro(
+                    distItems,
+                    targetDataset,
+                    spatialItems,
+                    { skipSpatialImportForSample: true }
+                );
+                snapLog(
+                    `Baseline direct: ${baselinePrepared.fileDescItems.length} schema YAML block(s) ready.`,
+                    "ok"
+                );
+            }
+
             snapLog(
-                "Phase 2/3: per-case stream (spatial_sql → plan → execute → capture final SQL)",
+                evalPipeline === "baseline_direct"
+                    ? "Phase 2/3: per-case baseline (profile + question → LLM SQL → execute)"
+                    : "Phase 2/3: per-case stream (spatial_sql → plan → execute → capture final SQL)",
                 "info"
             );
 
             const caseRows: EvalCaseRow[] = [...initialCaseRows];
+            const baselineEngine =
+                evalPipeline === "baseline_direct"
+                    ? await agent.model.getEngine()
+                    : null;
 
             for (let i = startCaseIndex; i < targetCases.length; i++) {
                 if (cancelRef.current) {
@@ -567,15 +615,52 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                         continue;
                     }
 
-                    const caseStream = await agent.stream(c.question, {
-                        geoEvalCaptureExecutedSql: true
-                    });
-                    const collected = await collectStream(caseStream);
+                    let collected: {
+                        runLogs: string[];
+                        streamError?: string;
+                    };
+                    let sqlFirst: string | undefined;
+                    let sqlFinal: string | undefined;
+                    let sanitizerFixes: string[] | undefined;
+                    let caseLlmUsage: ReturnType<typeof parseLlmUsageFromSystemLogs>;
+
+                    if (evalPipeline === "baseline_direct") {
+                        if (!baselinePrepared || !baselineEngine) {
+                            throw new Error("Baseline context not prepared.");
+                        }
+                        const baseline = await generateBaselineDirectSql(
+                            baselineEngine,
+                            {
+                                question: c.question,
+                                metadataBrief: baselinePrepared.metadataBrief,
+                                fileDescItems: baselinePrepared.fileDescItems
+                            }
+                        );
+                        collected = { runLogs: baseline.systemLogs };
+                        caseLlmUsage =
+                            baseline.llm_usage ||
+                            parseLlmUsageFromSystemLogs(baseline.systemLogs);
+                        sqlFinal = baseline.sql?.trim();
+                        sqlFirst = sqlFinal;
+                        if (baseline.rejectReason && !sqlFinal) {
+                            collected.streamError = baseline.rejectReason;
+                        }
+                    } else {
+                        const caseStream = await agent.stream(c.question, {
+                            geoEvalCaptureExecutedSql: true
+                        });
+                        collected = await collectStream(caseStream);
+                        caseLlmUsage = parseLlmUsageFromSystemLogs(
+                            collected.runLogs
+                        );
+                        const input = agent.lastEvalChainInput;
+                        sqlFirst = input?.evalCapturedExecutedSqlFirst?.trim();
+                        sqlFinal = input?.evalCapturedExecutedSql?.trim();
+                        sanitizerFixes = input?.evalCapturedSanitizerFixes;
+                    }
+
                     const caseFinishedAt = new Date().toISOString();
                     const caseWallMs = performance.now() - caseT0;
-                    const caseLlmUsage = parseLlmUsageFromSystemLogs(
-                        collected.runLogs
-                    );
                     for (const line of collected.runLogs) {
                         snapLog(`  [System] ${line}`, "info");
                     }
@@ -585,11 +670,6 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                             "warn"
                         );
                     }
-
-                    const input = agent.lastEvalChainInput;
-                    const sqlFirst = input?.evalCapturedExecutedSqlFirst?.trim();
-                    const sqlFinal = input?.evalCapturedExecutedSql?.trim();
-                    const sanitizerFixes = input?.evalCapturedSanitizerFixes;
 
                     const saFirst = isReadableSql(sqlFirst);
                     const saFinal = isReadableSql(sqlFinal);
@@ -771,7 +851,8 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                     openAiModel:
                         llmProvider === "openai"
                             ? openAiModel.trim()
-                            : undefined
+                            : undefined,
+                    evalPipeline
                 });
                 reportsBySlug[targetSlug] = partialReport;
                 persistCheckpointState({
@@ -805,6 +886,7 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                 llmProvider,
                 openAiModel:
                     llmProvider === "openai" ? openAiModel.trim() : undefined,
+                evalPipeline,
                 runTiming: {
                     started_at: datasetRunStartedAt,
                     finished_at: datasetRunFinishedAt,
@@ -839,7 +921,8 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
             checkpoint?.startedAt,
             persistCheckpointState,
             llmProvider,
-            openAiModel
+            openAiModel,
+            evalPipeline
         ]
     );
 
@@ -911,7 +994,8 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
             openAiApiKey,
             openAiBaseUrl,
             openAiModel,
-            openAiDefaults.apiKey
+            openAiDefaults.apiKey,
+            evalPipeline
         ]
     );
 
@@ -952,6 +1036,7 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                 );
             }
             localStorage.setItem(LS_LLM_PROVIDER, llmProvider);
+            localStorage.setItem(LS_EVAL_PIPELINE, evalPipeline);
 
             const runId = resumeCp?.runId || newRunId();
             const startedAt = resumeCp?.startedAt || new Date().toISOString();
@@ -978,10 +1063,14 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
             const evalRunT0 = performance.now();
 
             try {
+                const pipelineLabel =
+                    evalPipeline === "baseline_direct"
+                        ? "baseline direct (profile + question → SQL)"
+                        : "production AgentChain";
                 appendLog(
                     resumeCp
-                        ? `=== Resuming eval (${mode}) run ${runId} ===`
-                        : `=== Starting eval (${mode}) — production AgentChain ===`,
+                        ? `=== Resuming eval (${mode}) run ${runId} — ${pipelineLabel} ===`
+                        : `=== Starting eval (${mode}) — ${pipelineLabel} ===`,
                     "info"
                 );
                 if (mode === "all") {
@@ -1170,6 +1259,7 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
             ensureAgent,
             runOneDataset,
             persistCheckpointState,
+            evalPipeline,
             llmProvider,
             openAiApiKey,
             openAiBaseUrl,
@@ -1321,6 +1411,29 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                 >
                     <div style={{ marginBottom: 8, fontWeight: 600 }}>
                         LLM backend (eval only)
+                    </div>
+                    <div style={{ marginBottom: 16 }}>
+                        <div style={{ marginBottom: 8, fontWeight: 600 }}>
+                            Eval pipeline
+                        </div>
+                        <RadioGroup
+                            name="evalPipeline"
+                            value={evalPipeline}
+                            onChange={(v) => {
+                                setEvalPipeline(v as EvalPipelineMode);
+                                agentRef.current = null;
+                            }}
+                            disabled={running}
+                        >
+                            <Radio value="agent">
+                                Full pipeline — AgentChain, task-spec, spatial
+                                contracts
+                            </Radio>
+                            <Radio value="baseline_direct">
+                                Baseline direct — dataset profile + question →
+                                one LLM SQL (no routing / task-spec)
+                            </Radio>
+                        </RadioGroup>
                     </div>
                     <RadioGroup
                         name="evalLlmProvider"

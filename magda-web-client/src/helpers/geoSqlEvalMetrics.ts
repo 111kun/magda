@@ -27,7 +27,7 @@ export type EvalRunTiming = {
     cases_wall_ms_sum?: number;
 };
 
-const USAGE_LINE_RE = /(?:Planner LLM usage|Intro LLM usage|\[GeoTaskInterpreter\] LLM usage|\[SpatialIntentRouter\] LLM usage):\s*prompt=(\d+)\s+completion=(\d+)\s+total=(\d+)/i;
+const USAGE_LINE_RE = /(?:Planner LLM usage|Intro LLM usage|\[GeoTaskInterpreter\] LLM usage|\[SpatialIntentRouter\] LLM usage|\[BaselineDirect\] LLM usage):\s*prompt=(\d+)\s+completion=(\d+)\s+total=(\d+)/i;
 
 function emptySlice(): EvalLlmUsageSlice {
     return {
@@ -43,6 +43,7 @@ function sourceFromLogLine(line: string): string {
     if (/Intro LLM usage/i.test(line)) return "intro";
     if (/GeoTaskInterpreter/i.test(line)) return "task_spec";
     if (/SpatialIntentRouter/i.test(line)) return "spatial_router";
+    if (/BaselineDirect/i.test(line)) return "baseline_direct";
     return "other";
 }
 

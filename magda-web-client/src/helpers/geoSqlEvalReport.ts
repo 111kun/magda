@@ -88,6 +88,8 @@ export type GeoSqlEvalReport = {
         app_name?: string;
         llm_provider?: "webllm" | "openai";
         openai_model?: string;
+        /** agent = full AgentChain; baseline_direct = profile + question → one LLM SQL */
+        eval_pipeline?: "agent" | "baseline_direct";
         run_timing?: EvalRunTiming;
         llm_usage_total?: EvalLlmUsageBreakdown;
     };
@@ -207,12 +209,15 @@ export function buildReport(params: {
     llmProvider?: "webllm" | "openai";
     openAiModel?: string;
     runTiming?: EvalRunTiming;
+    evalPipeline?: "agent" | "baseline_direct";
 }): GeoSqlEvalReport {
     const summary = buildSummary(params.cases);
     return {
         meta: {
             framework:
-                "GeoSQL-Eval two-layer (Layer A: SA/EPR; Layer B: scalar numeric or row-set semantic match) — Final Report §4.3",
+                params.evalPipeline === "baseline_direct"
+                    ? "GeoSQL-Eval baseline direct (profile + question → LLM SQL; Layer A/B same harness)"
+                    : "GeoSQL-Eval two-layer (Layer A: SA/EPR; Layer B: scalar numeric or row-set semantic match) — Final Report §4.3",
             generated_at: new Date().toISOString(),
             dataset_slug: params.slug,
             magda_dataset_id: params.magdaDatasetId,
@@ -221,6 +226,7 @@ export function buildReport(params: {
             app_name: params.appName,
             llm_provider: params.llmProvider,
             openai_model: params.openAiModel,
+            eval_pipeline: params.evalPipeline,
             run_timing: params.runTiming,
             llm_usage_total: summary.llm_usage
         },
