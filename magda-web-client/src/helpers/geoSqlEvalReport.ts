@@ -1,6 +1,12 @@
 /**
  * GeoSQL evaluation report (Layer A / Layer B per Final Report §4.3).
  */
+import { aggregateCaseTimingMs, aggregateLlmUsage } from "./geoSqlEvalMetrics";
+import type {
+    EvalCaseTiming,
+    EvalLlmUsageBreakdown,
+    EvalRunTiming
+} from "./geoSqlEvalMetrics";
 import {
     compareQueryResults,
     rowsToComparableSignature,
@@ -46,6 +52,10 @@ export type EvalCaseRow = {
     };
     error_message?: string;
     system_logs?: string[];
+    /** Wall-clock for this case (stream + harness scoring). */
+    timing?: EvalCaseTiming;
+    /** Parsed from system_logs token usage lines. */
+    llm_usage?: EvalLlmUsageBreakdown;
 };
 
 export type EvalRunSummary = {
@@ -62,6 +72,9 @@ export type EvalRunSummary = {
         result_match_count: number;
     };
     error_buckets: Record<GeoSqlEvalErrorBucket, number>;
+    timing_ms_total?: number;
+    timing_ms_mean?: number;
+    llm_usage?: EvalLlmUsageBreakdown;
 };
 
 export type GeoSqlEvalReport = {
@@ -73,6 +86,10 @@ export type GeoSqlEvalReport = {
         dataset_title?: string;
         case_file?: string;
         app_name?: string;
+        llm_provider?: "webllm" | "openai";
+        openai_model?: string;
+        run_timing?: EvalRunTiming;
+        llm_usage_total?: EvalLlmUsageBreakdown;
     };
     summary: EvalRunSummary;
     cases: EvalCaseRow[];
@@ -154,6 +171,11 @@ export function buildSummary(cases: EvalCaseRow[]): EvalRunSummary {
         if (b !== "none") buckets[b]++;
     }
 
+    const timingAgg = aggregateCaseTimingMs(cases);
+    const llm_usage = aggregateLlmUsage(
+        cases.map((c) => c.llm_usage).filter(Boolean) as EvalLlmUsageBreakdown[]
+    );
+
     return {
         n: cases.length,
         layer_a: {
@@ -167,7 +189,10 @@ export function buildSummary(cases: EvalCaseRow[]): EvalRunSummary {
             result_accuracy: resultMatch / n,
             result_match_count: resultMatch
         },
-        error_buckets: buckets
+        error_buckets: buckets,
+        timing_ms_total: timingAgg.total_ms,
+        timing_ms_mean: timingAgg.mean_ms,
+        llm_usage: llm_usage.call_count ? llm_usage : undefined
     };
 }
 
@@ -179,7 +204,11 @@ export function buildReport(params: {
     appName?: string;
     cases: EvalCaseRow[];
     harnessLog: GeoSqlEvalReport["harness_log"];
+    llmProvider?: "webllm" | "openai";
+    openAiModel?: string;
+    runTiming?: EvalRunTiming;
 }): GeoSqlEvalReport {
+    const summary = buildSummary(params.cases);
     return {
         meta: {
             framework:
@@ -189,9 +218,13 @@ export function buildReport(params: {
             magda_dataset_id: params.magdaDatasetId,
             dataset_title: params.datasetTitle,
             case_file: params.caseFile,
-            app_name: params.appName
+            app_name: params.appName,
+            llm_provider: params.llmProvider,
+            openai_model: params.openAiModel,
+            run_timing: params.runTiming,
+            llm_usage_total: summary.llm_usage
         },
-        summary: buildSummary(params.cases),
+        summary,
         cases: params.cases,
         harness_log: params.harnessLog
     };
@@ -203,19 +236,53 @@ export type GeoSqlEvalCombinedReport = {
         generated_at: string;
         mode: "all_datasets";
         dataset_count: number;
+        run_timing?: EvalRunTiming;
+        llm_usage_total?: EvalLlmUsageBreakdown;
+        total_cases?: number;
     };
     datasets: GeoSqlEvalReport[];
 };
 
 export function downloadCombinedJsonReport(reports: GeoSqlEvalReport[]): void {
     const ts = new Date().toISOString().replace(/[:.]/g, "-");
+    const allCases = reports.flatMap((r) => r.cases);
+    const caseTiming = aggregateCaseTimingMs(allCases);
+    const llm_usage = aggregateLlmUsage(
+        reports
+            .map((r) => r.meta.llm_usage_total || r.summary.llm_usage)
+            .filter(Boolean) as EvalLlmUsageBreakdown[]
+    );
+    const runStarted = reports
+        .map((r) => r.meta.run_timing?.started_at)
+        .filter(Boolean)
+        .sort()[0];
+    const runFinished = reports
+        .map((r) => r.meta.run_timing?.finished_at)
+        .filter(Boolean)
+        .sort()
+        .reverse()[0];
+    const runWallSum = reports.reduce(
+        (a, r) => a + (r.meta.run_timing?.wall_ms || 0),
+        0
+    );
     const combined: GeoSqlEvalCombinedReport = {
         meta: {
             framework:
                 "GeoSQL-Eval two-layer — combined run (Layer A: SA/EPR; Layer B: semantic match)",
             generated_at: new Date().toISOString(),
             mode: "all_datasets",
-            dataset_count: reports.length
+            dataset_count: reports.length,
+            total_cases: allCases.length,
+            run_timing:
+                runStarted && runFinished
+                    ? {
+                          started_at: runStarted,
+                          finished_at: runFinished,
+                          wall_ms: runWallSum,
+                          cases_wall_ms_sum: caseTiming.total_ms
+                      }
+                    : undefined,
+            llm_usage_total: llm_usage.call_count ? llm_usage : undefined
         },
         datasets: reports
     };
@@ -250,8 +317,22 @@ export function downloadCsvSummary(report: GeoSqlEvalReport): void {
         `layer_a_repair_gain_count,${s.layer_a.repair_gain_count}`,
         `layer_b_result_accuracy,${s.layer_b.result_accuracy.toFixed(4)}`,
         `layer_b_result_match_count,${s.layer_b.result_match_count}`,
+        ...(s.timing_ms_total != null
+            ? [
+                  `timing_ms_total,${Math.round(s.timing_ms_total)}`,
+                  `timing_ms_mean,${Math.round(s.timing_ms_mean || 0)}`
+              ]
+            : []),
+        ...(s.llm_usage
+            ? [
+                  `llm_prompt_tokens,${s.llm_usage.prompt_tokens}`,
+                  `llm_completion_tokens,${s.llm_usage.completion_tokens}`,
+                  `llm_total_tokens,${s.llm_usage.total_tokens}`,
+                  `llm_call_count,${s.llm_usage.call_count}`
+              ]
+            : []),
         "",
-        "case_id,layer_b_result_match,layer_b_match_mode,sa_first,sa_final,epr_first,epr_final,repair_gain,error_bucket_final",
+        "case_id,layer_b_result_match,layer_b_match_mode,sa_first,sa_final,epr_first,epr_final,repair_gain,error_bucket_final,timing_ms,llm_total_tokens",
         ...report.cases.map((c) =>
             [
                 c.case_id,
@@ -262,7 +343,9 @@ export function downloadCsvSummary(report: GeoSqlEvalReport): void {
                 c.layer_a.execution_pass_first ? "1" : "0",
                 c.layer_a.execution_pass_final ? "1" : "0",
                 c.layer_a.repair_gain ? "1" : "0",
-                c.layer_a.error_bucket_final
+                c.layer_a.error_bucket_final,
+                c.timing?.wall_ms ?? "",
+                c.llm_usage?.total_tokens ?? ""
             ].join(",")
         )
     ];

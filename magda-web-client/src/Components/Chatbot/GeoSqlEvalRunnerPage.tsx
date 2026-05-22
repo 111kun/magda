@@ -38,6 +38,10 @@ import {
     isReadableSql
 } from "helpers/geoSqlEvalReport";
 import {
+    formatDurationMs,
+    parseLlmUsageFromSystemLogs
+} from "helpers/geoSqlEvalMetrics";
+import {
     clearEvalCheckpoint,
     EVAL_SLUG_ORDER,
     EvalRunMode,
@@ -439,6 +443,10 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                 appendLog(message, level);
             };
 
+            const datasetRunStartedAt = new Date().toISOString();
+            const datasetRunT0 = performance.now();
+            let warmupWallMs = 0;
+
             const fakeLocation = {
                 pathname: `/dataset/${targetDatasetId}`,
                 search: "",
@@ -453,10 +461,12 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                 "info"
             );
             agent.clearDatasetProfileCache();
+            const warmupT0 = performance.now();
             const warmupStream = await agent.stream("warmup", {
                 warmupOnly: true
             });
             const warmupCollected = await collectStream(warmupStream);
+            warmupWallMs = performance.now() - warmupT0;
             for (const line of warmupCollected.runLogs) {
                 snapLog(`[System] ${line}`, "info");
             }
@@ -476,7 +486,9 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                 );
             }
             snapLog(
-                `Warmup done: ${spatialItems.length} spatial profile item(s)`,
+                `Warmup done: ${
+                    spatialItems.length
+                } spatial profile item(s) (${formatDurationMs(warmupWallMs)})`,
                 "ok"
             );
 
@@ -509,6 +521,8 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                 }
 
                 const c = targetCases[i];
+                const caseStartedAt = new Date().toISOString();
+                const caseT0 = performance.now();
                 snapLog(
                     `[${i + 1}/${targetCases.length}] ${
                         c.id
@@ -542,7 +556,12 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                                 gold_row_count: 0,
                                 model_row_count: 0
                             },
-                            error_message: `dataset_slug mismatch (expected ${targetSlug})`
+                            error_message: `dataset_slug mismatch (expected ${targetSlug})`,
+                            timing: {
+                                wall_ms: performance.now() - caseT0,
+                                started_at: caseStartedAt,
+                                finished_at: new Date().toISOString()
+                            }
                         });
                         snapLog("  ✗ slug mismatch, skipped", "warn");
                         continue;
@@ -552,6 +571,11 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                         geoEvalCaptureExecutedSql: true
                     });
                     const collected = await collectStream(caseStream);
+                    const caseFinishedAt = new Date().toISOString();
+                    const caseWallMs = performance.now() - caseT0;
+                    const caseLlmUsage = parseLlmUsageFromSystemLogs(
+                        collected.runLogs
+                    );
                     for (const line of collected.runLogs) {
                         snapLog(`  [System] ${line}`, "info");
                     }
@@ -648,7 +672,15 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                             resultMatch || execFinal.ok
                                 ? undefined
                                 : errFinal || errFirst || goldErr,
-                        system_logs: collected.runLogs
+                        system_logs: collected.runLogs,
+                        timing: {
+                            wall_ms: caseWallMs,
+                            started_at: caseStartedAt,
+                            finished_at: caseFinishedAt
+                        },
+                        llm_usage: caseLlmUsage.call_count
+                            ? caseLlmUsage
+                            : undefined
                     };
                     caseRows.push(row);
 
@@ -679,11 +711,23 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                             saFinal ? "✓" : "✗"
                         } · EPR ${execFirst.ok ? "✓" : "✗"}/${
                             execFinal.ok ? "✓" : "✗"
-                        }${repairGain ? " · repair+" : ""}`,
+                        }${repairGain ? " · repair+" : ""} · ${formatDurationMs(
+                            caseWallMs
+                        )}${
+                            caseLlmUsage.call_count
+                                ? ` · LLM ${caseLlmUsage.total_tokens} tok (${caseLlmUsage.call_count} calls)`
+                                : ""
+                        }`,
                         "info"
                     );
                 } catch (caseErr) {
-                    snapLog(`  ✗ Case error: ${caseErr}`, "error");
+                    const caseWallMs = performance.now() - caseT0;
+                    snapLog(
+                        `  ✗ Case error: ${caseErr} · ${formatDurationMs(
+                            caseWallMs
+                        )}`,
+                        "error"
+                    );
                     caseRows.push({
                         case_id: c.id,
                         question: c.question,
@@ -706,7 +750,12 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                             gold_row_count: 0,
                             model_row_count: 0
                         },
-                        error_message: String(caseErr)
+                        error_message: String(caseErr),
+                        timing: {
+                            wall_ms: caseWallMs,
+                            started_at: caseStartedAt,
+                            finished_at: new Date().toISOString()
+                        }
                     });
                 }
 
@@ -717,7 +766,12 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                     caseFile: caseFileForSlug(targetSlug),
                     appName,
                     cases: caseRows,
-                    harnessLog: harnessLogSnapshot
+                    harnessLog: harnessLogSnapshot,
+                    llmProvider,
+                    openAiModel:
+                        llmProvider === "openai"
+                            ? openAiModel.trim()
+                            : undefined
                 });
                 reportsBySlug[targetSlug] = partialReport;
                 persistCheckpointState({
@@ -735,6 +789,11 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
             }
 
             snapLog("Phase 3/3: aggregate Layer A / Layer B", "info");
+            const datasetRunFinishedAt = new Date().toISOString();
+            const casesWallMsSum = caseRows.reduce(
+                (sum, row) => sum + (row.timing?.wall_ms || 0),
+                0
+            );
             const report = buildReport({
                 slug: targetSlug,
                 magdaDatasetId: targetDatasetId,
@@ -742,20 +801,46 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                 caseFile: caseFileForSlug(targetSlug),
                 appName,
                 cases: caseRows,
-                harnessLog: harnessLogSnapshot
+                harnessLog: harnessLogSnapshot,
+                llmProvider,
+                openAiModel:
+                    llmProvider === "openai" ? openAiModel.trim() : undefined,
+                runTiming: {
+                    started_at: datasetRunStartedAt,
+                    finished_at: datasetRunFinishedAt,
+                    wall_ms: performance.now() - datasetRunT0,
+                    warmup_wall_ms: warmupWallMs,
+                    cases_wall_ms_sum: casesWallMsSum
+                }
             });
             reportsBySlug[targetSlug] = report;
 
             const s = report.summary;
+            const tok = s.llm_usage?.total_tokens;
             snapLog(
                 `Done ${targetSlug} — Layer B ${(
                     s.layer_b.result_accuracy * 100
-                ).toFixed(1)}% (${s.layer_b.result_match_count}/${s.n})`,
+                ).toFixed(1)}% (${s.layer_b.result_match_count}/${
+                    s.n
+                }) · ${formatDurationMs(report.meta.run_timing?.wall_ms || 0)}${
+                    tok != null
+                        ? ` · LLM ${tok} tokens (${
+                              s.llm_usage?.call_count || 0
+                          } usage lines)`
+                        : ""
+                }`,
                 "ok"
             );
             return report;
         },
-        [appName, appendLog, checkpoint?.startedAt, persistCheckpointState]
+        [
+            appName,
+            appendLog,
+            checkpoint?.startedAt,
+            persistCheckpointState,
+            llmProvider,
+            openAiModel
+        ]
     );
 
     const ensureAgent = useCallback(
@@ -890,6 +975,7 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
 
             setRunning(true);
             setRunMode(mode);
+            const evalRunT0 = performance.now();
 
             try {
                 appendLog(
@@ -1033,8 +1119,19 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                         (a, r) => a + r.summary.layer_b.result_match_count,
                         0
                     );
+                    const totalWallMs = finishedReports.reduce(
+                        (a, r) => a + (r.meta.run_timing?.wall_ms || 0),
+                        0
+                    );
+                    const totalTokens = finishedReports.reduce(
+                        (a, r) =>
+                            a + (r.meta.llm_usage_total?.total_tokens || 0),
+                        0
+                    );
                     appendLog(
-                        `All datasets finished — Layer B ${totalMatch}/${totalN} cases matched overall`,
+                        `All datasets finished — Layer B ${totalMatch}/${totalN} cases matched overall · ${formatDurationMs(
+                            totalWallMs
+                        )}${totalTokens ? ` · LLM ${totalTokens} tokens` : ""}`,
                         "ok"
                     );
                 }
@@ -1045,7 +1142,12 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                 ) {
                     clearEvalCheckpoint();
                     setCheckpoint(null);
-                    appendLog("Checkpoint cleared (run completed).", "ok");
+                    appendLog(
+                        `Checkpoint cleared (run completed). Wall time ${formatDurationMs(
+                            performance.now() - evalRunT0
+                        )}.`,
+                        "ok"
+                    );
                 }
             } catch (e) {
                 appendLog(`Eval aborted: ${e}`, "error");
@@ -1470,6 +1572,8 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                                 <th>Cases</th>
                                 <th>Layer B</th>
                                 <th>EPR (final)</th>
+                                <th>Run time</th>
+                                <th>LLM tokens</th>
                             </tr>
                         </thead>
                         <tbody>
@@ -1496,6 +1600,17 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                                             r.summary.layer_a.epr_final * 100
                                         ).toFixed(1)}
                                         %
+                                    </td>
+                                    <td>
+                                        {r.meta.run_timing
+                                            ? formatDurationMs(
+                                                  r.meta.run_timing.wall_ms
+                                              )
+                                            : "—"}
+                                    </td>
+                                    <td>
+                                        {r.meta.llm_usage_total?.total_tokens ??
+                                            "—"}
                                     </td>
                                 </tr>
                             ))}
@@ -1568,6 +1683,37 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                             ).toFixed(1)}
                             %
                         </div>
+                        {lastReport.meta.run_timing ? (
+                            <div>
+                                <strong>Run time</strong>
+                                <br />
+                                {formatDurationMs(
+                                    lastReport.meta.run_timing.wall_ms
+                                )}
+                                {lastReport.meta.run_timing.warmup_wall_ms !=
+                                null ? (
+                                    <>
+                                        <br />
+                                        <span style={{ color: "#666" }}>
+                                            warmup{" "}
+                                            {formatDurationMs(
+                                                lastReport.meta.run_timing
+                                                    .warmup_wall_ms
+                                            )}
+                                        </span>
+                                    </>
+                                ) : null}
+                            </div>
+                        ) : null}
+                        {lastReport.meta.llm_usage_total ? (
+                            <div>
+                                <strong>LLM tokens</strong>
+                                <br />
+                                {lastReport.meta.llm_usage_total.total_tokens} (
+                                {lastReport.meta.llm_usage_total.call_count}{" "}
+                                calls)
+                            </div>
+                        ) : null}
                     </div>
 
                     <div style={{ overflowX: "auto" }}>
@@ -1577,6 +1723,8 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                                     <th>Case</th>
                                     <th>Layer B</th>
                                     <th>EPR first/final</th>
+                                    <th>Time</th>
+                                    <th>Tokens</th>
                                     <th>Notes</th>
                                 </tr>
                             </thead>
@@ -1606,6 +1754,16 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                                             {r.layer_a.execution_pass_final
                                                 ? "✓"
                                                 : "✗"}
+                                        </td>
+                                        <td style={{ fontSize: 12 }}>
+                                            {r.timing
+                                                ? formatDurationMs(
+                                                      r.timing.wall_ms
+                                                  )
+                                                : "—"}
+                                        </td>
+                                        <td style={{ fontSize: 12 }}>
+                                            {r.llm_usage?.total_tokens ?? "—"}
                                         </td>
                                         <td style={{ fontSize: 12 }}>
                                             {r.error_message ? (
