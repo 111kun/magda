@@ -722,7 +722,36 @@ function mergeAnswerShape(
 }
 
 /**
- * Markdown block for the GeoSQL planner: schema-linked contract, not prose fluff.
+ * Compact JSON plan for the SQL executor LLM (no duplicate scope/spatial prose).
+ */
+export function formatTaskSpecExecutionPlanForPlanner(
+    spec: GeoQueryTaskSpec
+): string {
+    const p = spec.plan;
+    return JSON.stringify(
+        {
+            schema_table: p.schema_table,
+            target_pattern: p.target_pattern,
+            answer_shape_guardrail: p.answer_shape_guardrail,
+            bindings: p.bindings.map((b) => ({
+                physical_key: b.physical_key,
+                role: b.role,
+                sql_access: b.sql_access,
+                filter_literal: b.filter_literal
+            })),
+            operations: p.operations,
+            spatial: p.spatial,
+            output_columns: p.output_columns,
+            draft_sql_sketch: p.draft_sql_sketch,
+            logic_trace: p.logic_trace
+        },
+        null,
+        2
+    );
+}
+
+/**
+ * Full markdown plan for harness logs (task-spec interpreter output).
  */
 export function formatTaskSpecForPlanner(spec: GeoQueryTaskSpec): string {
     const p = spec.plan;

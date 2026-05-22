@@ -40,7 +40,6 @@ import {
 } from "./queryGeoDataset/distribution";
 import { sampleGeoPropertyKeys } from "./queryGeoDataset/schema";
 import {
-    buildGeoSqlOutputGuidance,
     chooseCoreDisplayKeys,
     formatGeoSqlPropertyProjection,
     getGeoSqlErrorSuggestion,
@@ -53,6 +52,7 @@ import {
 } from "./queryGeoDataset/scopeExtractor";
 import {
     buildDeterministicTaskSpec,
+    formatTaskSpecExecutionPlanForPlanner,
     formatTaskSpecForPlanner,
     GeoQueryTaskSpec,
     resolveGeoQueryTaskSpec
@@ -448,48 +448,29 @@ export async function planGeoSqlQuery(
     console.log("[planGeoSqlQuery] calling engine.resetChat() before planner…");
     await webLlmResetChat(engine);
     console.log("[planGeoSqlQuery] engine.resetChat() completed.");
-    const schemaContextLabel =
-        "Dataset information (authoritative schema + sample values for SQL key/value grounding)";
     const distList = dists
         .map((item) => `${item.idx}: ${item.dist.title} (${item.dist.format})`)
         .join("\n");
     const plannerSystemInstruction = [
         "## Role",
-        "You are a Magda GeoSQL Expert. Your sole task is to emit a JSON plan whose `sqlQuery` field contains valid PostGIS SQL against the table `features` (when type is `query`).",
+        "You are a GeoSQL **executor**. Upstream task-spec has already fixed intent (target_pattern, bindings, spatial mode). Your job is ONLY to emit JSON with executable `sqlQuery` for table `features`.",
         "",
-        "## Database Schema (CRITICAL)",
-        "- Table name: `features` only. The browser runtime loads the chosen spatial distribution into this table; never use dataset title, distribution title, file names, or invented table names (e.g. no `Manningham_Street_Trees`).",
-        `- Source of truth for schema/keys/values: the \`${schemaContextLabel}\` block in the USER message. The \`properties_schema.keys\` map lists every valid key; access via \`properties->>'key'\`. Do not invent keys outside it.`,
-        "- Columns:",
-        "  - `id`: unique row identifier.",
-        "  - `geom`: geometry in SRID 4326.",
-        "  - `properties`: JSONB holding all non-geometry attributes.",
-        "- Property access: `properties->>'key'` for text; `(properties->>'key')::numeric` / `::int` / `::boolean` for typed comparisons when appropriate; `properties->'key'` for nested JSON.",
-        "- NON-NEGOTIABLE: Except `id`, `geom`, and `properties`, DO NOT reference bare columns (e.g. `suburb`, `name`) in SELECT/WHERE/GROUP BY/ORDER BY. All business attributes MUST be accessed from `properties` JSONB.",
+        "## Database (CRITICAL)",
+        "- Table: `features` only (`id`, `geom` SRID 4326, `properties` JSONB). Never invent table names.",
+        "- Business fields: `properties->>'key'` only; keys must appear in the execution plan bindings or schema YAML.",
+        "- Do not re-classify the question (e.g. do not turn AGGREGATE_GROUP_BY / LIST_ROWS into scalar COUNT).",
         "",
-        "## PostGIS Function Catalog (Spatial Toolset)",
-        "Use only PostGIS patterns appropriate to the question. Common patterns:",
-        "1. **Proximity in degrees (planar geometry, small areas)**: `ST_DWithin(features.geom, <ref_geom>, <distance_degrees>)` — use small thresholds only when the user implies degree-based buffers.",
-        "2. **Proximity in meters (recommended for real distances)**: `ST_DWithin(features.geom::geography, <ref_geom>::geography, <meters>)` (or symmetric variants).",
-        "3. **Distance / ordering**: `ST_Distance(...)`, `ORDER BY geom <-> ref` for nearest-neighbour style queries when suitable.",
-        "4. **Literal point**: `ST_SetSRID(ST_MakePoint(lon, lat), 4326)` when the user gives explicit coordinates.",
-        "5. **Rendering / map preview**: always include `ST_AsText(geom) AS geom_wkt` in the final SELECT projection (alongside compact columns).",
-        "6. **Reference placeholder**: when Parser reference context indicates an external place, use the literal token `__REF_POINT__` in SQL as a ready-made geometry in SRID 4326. Use it directly inside spatial functions (e.g. `ST_DWithin`, `ST_Distance`, `ST_Intersects`). Do not wrap it in `ST_MakePoint`, do not read `.__REF_POINT__.lon` / `.lat`, and do not substitute prose.",
+        "## Implement the execution plan",
+        "- Follow `target_pattern`, `operations`, `spatial`, `output_columns`, and `draft_sql_sketch` in the USER message JSON.",
+        "- Use operators listed in `operations` (e.g. COUNT(*), ST_Perimeter, ST_Length, ST_Area, GROUP BY keys from bindings).",
+        "- If `spatial.needs_external_geocode` is true, set `placeName` and use `__REF_POINT__` in sqlQuery; for internal anchors use CTE/subquery per reference note, not invented coordinates.",
+        "- LIST_ROWS / multi-row answers: include needed columns; optional `ST_AsText(geom) AS geom_wkt` for map preview.",
         "",
-        "## Planning Rules",
-        '1. **No guessing keys**: If a JSONB key is not present in `properties_schema.keys` (see YAML), do not invent it. If the user uses a vague label (e.g. "name"), map to the closest existing key using metadata/sample evidence.',
-        "2. **Self-join / CTE for in-dataset anchors**: When the reference is an existing feature identified by column/key + value (e.g. a street name, id, species), do **not** set `placeName` or rely on `__REF_POINT__`. Use a CTE, e.g. `WITH ref AS (SELECT geom FROM features WHERE properties->>'street' = 'King St' LIMIT 1) SELECT ... FROM features, ref WHERE ST_DWithin(features.geom, ref.geom, ...)` (adjust keys/values to real keys).",
-        "3. **External place only**: If Parser reference context says external `place=<text>`, set `placeName` to that exact text and use `__REF_POINT__` in `sqlQuery` wherever that external location is needed.",
-        "4. **Single executable statement**: `sqlQuery` must be one `SELECT` or `WITH ... SELECT` only; no DDL/DML; no multiple statements; no markdown, apologies, comments outside SQL, or JSON around the SQL.",
-        "5. **Compact SELECT**: Prefer `id`, a few `properties->>'...'` columns needed to answer the question, computed metrics, and `ST_AsText(geom) AS geom_wkt`. Avoid `SELECT *`, raw `geom` binary, or entire `properties` unless the user explicitly asks.",
-        "6. **If no spatial SQL is needed** (pure metadata chat, greetings, non-geo filters only): return `not_applicable` (see Output Format).",
-        "",
-        "## Output Format",
-        "Return **ONLY** raw JSON. No markdown fences, no prose before or after the JSON.",
-        "If spatial analysis applies:",
-        '{"type":"query","distributionIndex":<integer>,"sqlQuery":"<single SELECT or WITH...SELECT>","placeName":"<optional string>","countrycodes":"<optional ISO country code for geocoder, e.g. au>"}',
-        "If spatial analysis does not apply:",
-        '{"type":"not_applicable","reason":"<short reason>"}'
+        "## Output",
+        "Return **ONLY** raw JSON (no markdown).",
+        '{"type":"query","distributionIndex":<int>,"sqlQuery":"<SELECT or WITH...SELECT>","placeName":"<optional>","countrycodes":"<optional>"}',
+        "If the plan cannot be implemented without changing target_pattern or inventing keys:",
+        '{"type":"not_applicable","reason":"<cite plan field>"}'
     ].join("\n");
     const plannerPropertyKeys = getPlannerPropertyKeys(this);
     if (plannerPropertyKeys.length) {
@@ -567,63 +548,57 @@ export async function planGeoSqlQuery(
         this.question,
         scope.boundFilters
     );
-    const relevantKeySet = new Set(relevantKeys);
+    const plannerSchemaKeys = new Set(relevantKeys);
+    for (const b of taskSpec.plan.bindings) {
+        plannerSchemaKeys.add(b.physical_key);
+    }
     const prunedFileDescItems = fileDescItems?.length
-        ? plannerPropertyKeys.length > SCHEMA_KEY_BUDGET
-            ? fileDescItems.map((yaml) => pruneSchemaYaml(yaml, relevantKeySet))
-            : fileDescItems
+        ? fileDescItems.map((yaml) => pruneSchemaYaml(yaml, plannerSchemaKeys))
         : undefined;
-    if (plannerPropertyKeys.length > SCHEMA_KEY_BUDGET) {
+    if (plannerPropertyKeys.length > plannerSchemaKeys.size) {
         pushGeoRunLog(
             this,
-            `Schema pruned: ${relevantKeys.length}/${
-                plannerPropertyKeys.length
-            } keys kept (${relevantKeys.join(", ")}).`
+            `Planner schema pruned to plan/bindings: ${
+                plannerSchemaKeys.size
+            }/${plannerPropertyKeys.length} keys (${[...plannerSchemaKeys].join(
+                ", "
+            )}).`
         );
     }
-    const outputGuidance = buildGeoSqlOutputGuidance(relevantKeys);
-    const plannerUserPrompt =
-        `User question:\n${this.question}\n\n` +
-        `${formatTaskSpecForPlanner(taskSpec)}\n\n` +
-        `Spatial coverage mentions from question (dataset scope terms):\n${
-            coverageAndReference.coverageMentions.length
-                ? coverageAndReference.coverageMentions.join(", ")
-                : "none"
-        }\n\n` +
-        `Reference point context (queryGeoDataset inferred):\n${formatGeoReferenceForPlanner(
-            coverageAndReference.reference
-        )}\n\n` +
-        `Reference source:\n${coverageAndReference.source}\n\n` +
-        `Bound filters inferred from question (authoritative unless contradicted by schema):\n${
-            scope.boundFilters.length
-                ? scope.boundFilters
-                      .map(
-                          (item) =>
-                              `${item.key}=${item.value} (source=${
-                                  item.source
-                              }, confidence=${item.confidence.toFixed(2)})`
-                      )
-                      .join("; ")
-                : "none"
-        }\n\n` +
-        `External reference policy:\n${
-            scope.needsExternalReference
-                ? `External place candidate=${scope.externalPlace || "n/a"}`
-                : "No external reference needed; prefer attribute filters over geocoding."
-        }\n\n` +
-        `Spatial intent detail:\n${JSON.stringify(scope.spatialIntent)}\n\n` +
-        `${buildSpatialInstructionFromScope(scope)}\n\n` +
-        `${buildCountInstructionFromScope(scope, taskSpec)}\n\n` +
-        `SQL output guidance:\n${outputGuidance}\n\n` +
-        `Available spatial distributions:\n${distList}\n\n` +
-        `Dataset information (high-level metadata; use this as dataset context):\n${
-            metadataBrief || "N/A"
-        }\n\n` +
-        `${schemaContextLabel}:\n${
-            prunedFileDescItems?.length
-                ? prunedFileDescItems.join("\n---\n")
-                : "N/A"
-        }`;
+
+    const executionPlanJson = formatTaskSpecExecutionPlanForPlanner(taskSpec);
+    const geoRef = coverageAndReference.reference;
+    const referenceNote = formatGeoReferenceForPlanner(geoRef);
+    const externalPlace = geoRef.type === "external" ? geoRef.place.trim() : "";
+    const needsExternalPlace =
+        taskSpec.plan.spatial.needs_external_geocode && !!externalPlace;
+    const plannerUserPrompt = [
+        "## Authoritative execution plan (JSON — do not change target_pattern)",
+        executionPlanJson,
+        "",
+        "## User question (wording only; intent is already in the plan above)",
+        this.question,
+        "",
+        "## Spatial distributions (pick distributionIndex)",
+        distList,
+        "",
+        "## Reference (apply only as required by plan.spatial)",
+        `source: ${coverageAndReference.source}`,
+        referenceNote,
+        needsExternalPlace
+            ? `If plan requires geocode: set placeName to "${externalPlace}" and use __REF_POINT__ in sqlQuery.`
+            : "No external placeName unless plan.spatial.needs_external_geocode is true.",
+        "",
+        "## Schema samples (binding keys only — do not invent other properties keys)",
+        prunedFileDescItems?.length
+            ? prunedFileDescItems.join("\n---\n")
+            : "N/A"
+    ].join("\n");
+
+    pushGeoRunLog(
+        this,
+        "Planner executor mode: slim prompt (plan JSON + binding-key schema only; no duplicate scope/count instructions)."
+    );
     const systemTokenEst = Math.ceil(plannerSystemInstruction.length / 3.5);
     const userTokenEst = Math.ceil(plannerUserPrompt.length / 3.5);
     const totalTokenEst = systemTokenEst + userTokenEst;
@@ -677,6 +652,7 @@ export async function planGeoSqlQuery(
     }
     const raw = reply?.choices?.[0]?.message?.content?.trim();
     if (!raw) {
+        pushGeoRunLog(this, "Planner rejected: empty LLM reply.");
         return {
             type: "not_applicable",
             reason: "Planner did not return any result."
@@ -709,6 +685,7 @@ export async function planGeoSqlQuery(
             parsed?.type === "not_applicable" &&
             typeof (parsed as any).reason === "string"
         ) {
+            pushGeoRunLog(this, `Planner rejected: ${(parsed as any).reason}`);
             return {
                 type: "not_applicable",
                 reason: (parsed as any).reason
@@ -717,6 +694,10 @@ export async function planGeoSqlQuery(
     } catch {
         // Fall through to safe not-applicable path.
     }
+    pushGeoRunLog(
+        this,
+        "Planner rejected: invalid JSON (expected query or not_applicable)."
+    );
     return {
         type: "not_applicable",
         reason:
