@@ -57,6 +57,10 @@ import {
     GeoQueryTaskSpec,
     resolveGeoQueryTaskSpec
 } from "./queryGeoDataset/geoQueryTaskInterpreter";
+import {
+    questionImpliesGeomPredicateCount,
+    questionImpliesPropertyAttributeAggregate
+} from "./queryGeoDataset/geoQueryQuestionPatterns";
 import type { GeoReference, SpatialIntentResult } from "../chatRouteRouter";
 
 type GeoSqlPlanContext = {
@@ -186,7 +190,10 @@ function buildSpatialInstructionFromScope(scope: GeoQueryScope): string {
         );
     } else if (detail.type === "measurement") {
         lines.push(
-            "- Use spatial measurement functions: ST_Area / ST_Length with correct units."
+            "- Use spatial measurement functions: ST_Area / ST_Length / ST_Perimeter (polygons) with correct units."
+        );
+        lines.push(
+            "- For polygon features stored as MultiPolygon, perimeter uses ST_Perimeter(geom::geography); length along a centerline uses ST_Length."
         );
     }
 
@@ -210,6 +217,21 @@ function wantsCountContract(
     scope: GeoQueryScope,
     taskSpec?: GeoQueryTaskSpec
 ): boolean {
+    const pattern = taskSpec?.plan.target_pattern;
+    if (
+        pattern === "AGGREGATE_GROUP_BY" ||
+        pattern === "LIST_ROWS" ||
+        pattern === "MEASUREMENT"
+    ) {
+        return false;
+    }
+    if (
+        taskSpec?.plan.operations.some((o) =>
+            /^(SUM|AVG|MIN|MAX)\(/i.test(o.operator)
+        )
+    ) {
+        return false;
+    }
     return (
         scope.intentType === "count" ||
         (!!taskSpec && taskSpec.answerShape === "count")
@@ -233,11 +255,32 @@ function buildCountInstructionFromScope(
 
 function getSpatialContractViolation(
     sql: string,
-    scope: GeoQueryScope
+    scope: GeoQueryScope,
+    taskSpec?: GeoQueryTaskSpec,
+    question?: string
 ): string | null {
     const detail = scope.spatialIntent;
     if (detail.type === "none") {
         return null;
+    }
+    const q = question || "";
+    if (detail.type === "measurement") {
+        if (
+            taskSpec?.plan.target_pattern === "FILTER_COUNT" &&
+            questionImpliesGeomPredicateCount(q)
+        ) {
+            return null;
+        }
+        if (questionImpliesPropertyAttributeAggregate(q)) {
+            return null;
+        }
+        if (
+            taskSpec?.plan.operations.some((o) =>
+                /^(SUM|AVG|MIN|MAX)\(/i.test(o.operator)
+            )
+        ) {
+            return null;
+        }
     }
     const query = sql || "";
     if (detail.type === "distance_buffer") {
@@ -270,8 +313,8 @@ function getSpatialContractViolation(
         return null;
     }
     if (detail.type === "measurement") {
-        if (!/st_(area|length)\s*\(/i.test(query)) {
-            return "measurement query must use ST_Area/ST_Length";
+        if (!/st_(area|length|perimeter)\s*\(/i.test(query)) {
+            return "measurement query must use ST_Area/ST_Length/ST_Perimeter";
         }
         return null;
     }
@@ -462,7 +505,8 @@ export async function planGeoSqlQuery(
         "",
         "## Implement the execution plan",
         "- Follow `target_pattern`, `operations`, `spatial`, `output_columns`, and `draft_sql_sketch` in the USER message JSON.",
-        "- Use operators listed in `operations` (e.g. COUNT(*), ST_Perimeter, ST_Length, ST_Area, GROUP BY keys from bindings).",
+        "- Use operators listed in `operations` (e.g. COUNT(*), COUNT(DISTINCT …), ST_Perimeter, ST_Length, ST_Area, GROUP BY keys from bindings).",
+        "- Polygon/MultiPolygon perimeter: prefer ST_Perimeter(geom::geography) in meters; do not use ST_Length for closed polygon boundaries unless the question asks for a polyline length.",
         "- If `spatial.needs_external_geocode` is true, set `placeName` and use `__REF_POINT__` in sqlQuery; for internal anchors use CTE/subquery per reference note, not invented coordinates.",
         "- LIST_ROWS / multi-row answers: include needed columns; optional `ST_AsText(geom) AS geom_wkt` for map preview.",
         "",
@@ -1586,7 +1630,9 @@ export async function queryGeoSpatialWithSQLQuery(
 
     let spatialContractViolation = getSpatialContractViolation(
         finalSqlQuery,
-        scope
+        scope,
+        taskSpecForContract,
+        this.question
     );
     if (spatialContractViolation) {
         pushGeoRunLog(
@@ -1614,7 +1660,9 @@ export async function queryGeoSpatialWithSQLQuery(
             );
             spatialContractViolation = getSpatialContractViolation(
                 finalSqlQuery,
-                scope
+                scope,
+                taskSpecForContract,
+                this.question
             );
         }
     }

@@ -520,6 +520,31 @@ function enforceStDistanceGeography(
     return { query: output, changed };
 }
 
+/** SELECT with aggregate(s) only and no GROUP BY — scalar answer; do not append LIMIT 100. */
+function isScalarAggregateSelect(sql: string): boolean {
+    const q = (sql || "").trim().replace(/;+\s*$/g, "");
+    if (!/^\s*select\b/i.test(q) || /\bgroup\s+by\b/i.test(q)) {
+        return false;
+    }
+    const projMatch = q.match(/^\s*select\s+([\s\S]+?)\s+from\b/i);
+    if (!projMatch?.[1]) {
+        return false;
+    }
+    const proj = projMatch[1].trim();
+    if (!/\b(count|sum|avg|average|min|max)\s*\(/i.test(proj)) {
+        return false;
+    }
+    const nonAgg = proj
+        .replace(
+            /\b(count|sum|avg|average|min|max)\s*\(\s*(?:distinct\s+)?[\s\S]*?\)/gi,
+            ""
+        )
+        .replace(/\s+as\s+["']?\w+["']?/gi, "")
+        .replace(/,\s*/g, "")
+        .trim();
+    return nonAgg.length === 0;
+}
+
 export function sanitizeGeoSql(
     query: string,
     propKeys?: string[] | null
@@ -624,7 +649,7 @@ export function sanitizeGeoSql(
         );
     }
 
-    if (!/\blimit\s+\d+\b/i.test(output)) {
+    if (!/\blimit\s+\d+\b/i.test(output) && !isScalarAggregateSelect(output)) {
         const trimmed = output.trim().replace(/;+\s*$/g, "");
         output = `${trimmed}\nLIMIT 100`;
         fixes.push(

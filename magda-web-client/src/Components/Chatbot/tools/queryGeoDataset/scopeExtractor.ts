@@ -1,3 +1,8 @@
+import {
+    questionImpliesGeomPredicateCount,
+    questionImpliesPropertyAttributeAggregate
+} from "./geoQueryQuestionPatterns";
+
 type ValueSamplesByKey = Record<
     string,
     {
@@ -29,6 +34,7 @@ export type SpatialIntentDetail = {
         | "ST_Within"
         | "ST_Area"
         | "ST_Length"
+        | "ST_Perimeter"
     )[];
     parameters?: {
         distance_meters?: number;
@@ -312,10 +318,21 @@ function classifySpatialIntent(question: string): SpatialIntentDetail {
     );
     const hasMeasure = /(area|length|面积|多大|有多长|周长)/i.test(q);
 
+    if (questionImpliesGeomPredicateCount(question)) {
+        return { type: "none" };
+    }
+    if (questionImpliesPropertyAttributeAggregate(question)) {
+        return { type: "none" };
+    }
     if (hasMeasure) {
+        const operatorFamily: NonNullable<
+            SpatialIntentDetail["operatorFamily"]
+        > = /(perimeter|周长)/i.test(question)
+            ? ["ST_Perimeter", "ST_Area", "ST_Length"]
+            : ["ST_Area", "ST_Length", "ST_Perimeter"];
         return {
             type: "measurement",
-            operatorFamily: ["ST_Area", "ST_Length"]
+            operatorFamily
         };
     }
     if (hasNearest) {

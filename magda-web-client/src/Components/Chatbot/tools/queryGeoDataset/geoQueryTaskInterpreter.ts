@@ -1,6 +1,17 @@
 import type { MagdaChatEngine } from "../../magdaLlmEngine";
 import { webLlmChatCompletion, webLlmResetChat } from "../../webLlmSerial";
+import {
+    inferDistinctCountKey,
+    inferGroupByKeysFromQuestionEnhanced,
+    inferPropertyAggregateOperation,
+    questionImpliesDistinctCardinality,
+    questionImpliesGroupedBreakdown,
+    questionImpliesPropertyAttributeAggregate,
+    questionImpliesRowListing
+} from "./geoQueryQuestionPatterns";
 import type { GeoQueryScope } from "./scopeExtractor";
+
+export { matchPropertyKeyFromHint } from "./geoQueryQuestionPatterns";
 
 /** High-level SQL intent — drives contracts and planner hints. */
 export type ExecutionTargetPattern =
@@ -122,61 +133,11 @@ function answerShapeFromPattern(
     }
 }
 
-/** Pick schema key whose normalized form best matches a natural-language hint. */
-export function matchPropertyKeyFromHint(
-    hint: string,
-    propertyKeys: string[]
-): string | undefined {
-    const h = normToken(hint).replace(/[^a-z0-9\u4e00-\u9fff]+/g, "");
-    if (!h || h.length < 2) {
-        return undefined;
-    }
-    let best: { key: string; score: number } | undefined;
-    for (const key of propertyKeys) {
-        const kn = normToken(key).replace(/[^a-z0-9\u4e00-\u9fff]+/g, "");
-        if (!kn) {
-            continue;
-        }
-        let score = 0;
-        if (kn === h) {
-            score = 100;
-        } else if (kn.includes(h) || h.includes(kn)) {
-            score = 60;
-        } else if (h.length >= 4 && kn.includes(h.slice(0, 4))) {
-            score = 40;
-        }
-        if (score > 0 && (!best || score > best.score)) {
-            best = { key, score };
-        }
-    }
-    return best && best.score >= 40 ? best.key : undefined;
-}
-
 function inferGroupByKeysFromQuestion(
     question: string,
     propertyKeys: string[]
 ): string[] {
-    const q = question || "";
-    const keys = new Set<string>();
-
-    const patterns: RegExp[] = [
-        /\b(?:group\s+by|grouped\s+by)\s+([a-z0-9_]+)\b/i,
-        /\b(?:per|by|each|for\s+each)\s+([a-z0-9_\s]{2,40}?)(?:\s*[,.?]|$)/i,
-        /\b(?:in\s+each)\s+([a-z0-9_\s]{2,40}?)(?:\s*[,.?]|$)/i,
-        /(?:按|每个|各(?:个)?|每一(?:个)?)([^\s，。]{2,24}?)(?:的|统计|分组|计算|数量)/u
-    ];
-    for (const re of patterns) {
-        const m = q.match(re);
-        const raw = m?.[1]?.trim();
-        if (!raw) {
-            continue;
-        }
-        const matched = matchPropertyKeyFromHint(raw, propertyKeys);
-        if (matched) {
-            keys.add(matched);
-        }
-    }
-    return [...keys].slice(0, 6);
+    return inferGroupByKeysFromQuestionEnhanced(question, propertyKeys);
 }
 
 function resolveTargetPattern(
@@ -184,6 +145,19 @@ function resolveTargetPattern(
     question: string,
     groupByKeys: string[]
 ): ExecutionTargetPattern {
+    if (questionImpliesGroupedBreakdown(question)) {
+        return "AGGREGATE_GROUP_BY";
+    }
+    if (questionImpliesRowListing(question)) {
+        return "LIST_ROWS";
+    }
+    if (
+        questionImpliesPropertyAttributeAggregate(question) &&
+        groupByKeys.length === 0
+    ) {
+        return "FILTER_COUNT";
+    }
+
     const si = scope.spatialIntent;
     if (si.type === "measurement") {
         return "MEASUREMENT";
@@ -321,9 +295,41 @@ function buildBindings(
 
 function buildOperations(
     pattern: ExecutionTargetPattern,
-    groupByKeys: string[]
+    groupByKeys: string[],
+    question?: string,
+    propertyKeys?: string[]
 ): PlanOperation[] {
     if (pattern === "FILTER_COUNT") {
+        const distinctKey =
+            question &&
+            propertyKeys?.length &&
+            questionImpliesDistinctCardinality(question)
+                ? inferDistinctCountKey(question, propertyKeys)
+                : undefined;
+        if (distinctKey) {
+            const access = sqlAccessForPropertyKey(distinctKey);
+            return [
+                {
+                    label: "distinct_cardinality",
+                    operator: `COUNT(DISTINCT ${access})`,
+                    alias: "distinct_count"
+                }
+            ];
+        }
+        const propAgg =
+            question && propertyKeys?.length
+                ? inferPropertyAggregateOperation(question, propertyKeys)
+                : null;
+        if (propAgg) {
+            const access = sqlAccessForPropertyKey(propAgg.key);
+            return [
+                {
+                    label: "property_aggregate",
+                    operator: `${propAgg.fn}(${access})`,
+                    alias: `${propAgg.fn.toLowerCase()}_${propAgg.key}`
+                }
+            ];
+        }
         return [
             {
                 label: "row_cardinality",
@@ -364,10 +370,14 @@ function buildOperations(
         ];
     }
     if (pattern === "MEASUREMENT") {
+        const op =
+            question && /(perimeter|周长)/i.test(question)
+                ? "ST_Perimeter|ST_Length|ST_Area"
+                : "ST_Area|ST_Length|ST_Perimeter";
         return [
             {
                 label: "geom_metric",
-                operator: "ST_Area|ST_Length",
+                operator: op,
                 alias: "measure_value"
             }
         ];
@@ -509,19 +519,36 @@ export function buildSchemaLinkedExecutionPlan(input: {
     const groupByKeys = inferGroupByKeysFromQuestion(question, propertyKeys);
     let pattern = resolveTargetPattern(scope, question, groupByKeys);
 
-    if (pattern === "AGGREGATE_GROUP_BY" && groupByKeys.length === 0) {
+    const wantsGrouped = questionImpliesGroupedBreakdown(question);
+    if (wantsGrouped && pattern === "FILTER_COUNT") {
+        pattern = "AGGREGATE_GROUP_BY";
+    }
+    if (questionImpliesRowListing(question) && pattern === "FILTER_COUNT") {
+        pattern = "LIST_ROWS";
+    }
+    if (
+        pattern === "AGGREGATE_GROUP_BY" &&
+        groupByKeys.length === 0 &&
+        !wantsGrouped
+    ) {
         pattern = "FILTER_COUNT";
     }
     if (
         pattern === "UNKNOWN" &&
         scope.intentType === "aggregate" &&
-        groupByKeys.length === 0
+        groupByKeys.length === 0 &&
+        !wantsGrouped
     ) {
         pattern = "FILTER_COUNT";
     }
 
     const bindings = buildBindings(scope, propertyKeys, groupByKeys);
-    const operations = buildOperations(pattern, groupByKeys);
+    const operations = buildOperations(
+        pattern,
+        groupByKeys,
+        question,
+        propertyKeys
+    );
     const spatial = buildSpatialSummary(scope);
     const output_columns = buildOutputColumns(pattern, groupByKeys, operations);
     const answer_shape_guardrail = buildAnswerShapeGuardrail(
@@ -627,9 +654,17 @@ function mergePlanWithLlmPatch(
         return inferGroupByKeysFromQuestion(question, propertyKeys);
     })();
 
+    const wantsGrouped = questionImpliesGroupedBreakdown(question);
+    if (
+        patch.target_pattern === "FILTER_COUNT" &&
+        (wantsGrouped || questionImpliesRowListing(question))
+    ) {
+        pattern = wantsGrouped ? "AGGREGATE_GROUP_BY" : "LIST_ROWS";
+    }
     if (
         pattern === "AGGREGATE_GROUP_BY" &&
         groupByKeys.length === 0 &&
+        !wantsGrouped &&
         base.target_pattern !== "AGGREGATE_GROUP_BY"
     ) {
         pattern = "FILTER_COUNT";
@@ -659,7 +694,12 @@ function mergePlanWithLlmPatch(
         return merged;
     })();
 
-    const operations = buildOperations(pattern, groupByKeys);
+    const operations = buildOperations(
+        pattern,
+        groupByKeys,
+        question,
+        propertyKeys
+    );
     const output_columns = buildOutputColumns(pattern, groupByKeys, operations);
     const answer_shape_guardrail = buildAnswerShapeGuardrail(
         pattern,
@@ -699,6 +739,15 @@ function mergeAnswerShape(
     question: string
 ): GeoQueryAnswerShape {
     let candidate = answerShapeFromPattern(pattern);
+
+    if (
+        pattern === "AGGREGATE_GROUP_BY" ||
+        pattern === "LIST_ROWS" ||
+        questionImpliesGroupedBreakdown(question) ||
+        questionImpliesRowListing(question)
+    ) {
+        return candidate;
+    }
 
     if (scope.intentType === "count") {
         return "count";
@@ -930,7 +979,9 @@ export async function resolveGeoQueryTaskSpec(input: {
             "- Do NOT invent property keys. If unsure, return empty group_by_keys.",
             "- Do NOT output SQL with bare column names like `suburb` — attributes live in `properties->>'key'`.",
             "- target_pattern MUST be one of: FILTER_COUNT | LIST_ROWS | AGGREGATE_GROUP_BY | SPATIAL_FILTER | SPATIAL_NEAREST | SPATIAL_TOPOLOGY | MEASUREMENT | MIXED | UNKNOWN",
-            "- Prefer AGGREGATE_GROUP_BY when the user wants breakdown / per category / 按…分组; FILTER_COUNT for how-many totals without grouping.",
+            "- Prefer AGGREGATE_GROUP_BY when the user wants breakdown / per category / top-N / most common / 按…分组.",
+            "- Do NOT set FILTER_COUNT when the user asks for grouped breakdown, row listing, or top-N by a dimension.",
+            "- FILTER_COUNT is for scalar totals only (COUNT(*), COUNT(DISTINCT key), or property SUM/AVG without GROUP BY).",
             "",
             "## Output JSON shape",
             '{"target_pattern":"<enum>","group_by_keys":["<key>", "..."],"logic_trace":"<one sentence>","extra_bindings":[{"physical_key":"<key>","role":"GROUP_BY"|"FILTER"|"SELECT","logical_term":"<optional>"}]}'
