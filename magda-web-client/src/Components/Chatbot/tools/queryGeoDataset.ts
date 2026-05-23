@@ -59,6 +59,12 @@ import {
     resolveGeoQueryTaskSpec
 } from "./queryGeoDataset/geoQueryTaskInterpreter";
 import {
+    astFromTaskSpec,
+    shouldUseDeterministicRenderer
+} from "./queryGeoDataset/executableAst";
+import { renderSqlFromAst } from "./queryGeoDataset/sqlRenderer";
+import { tryRenderSpatialSql } from "./queryGeoDataset/spatialSqlRenderer";
+import {
     extractListRowLimitFromQuestion,
     questionImpliesGeomPredicateCount,
     questionImpliesPropertyAttributeAggregate
@@ -768,6 +774,57 @@ export async function planGeoSqlQuery(
                 ", "
             )}).`
         );
+    }
+
+    if (shouldUseDeterministicRenderer(taskSpec, this.question)) {
+        const ast = astFromTaskSpec(
+            taskSpec,
+            this.question,
+            plannerPropertyKeys
+        );
+        const deterministicSql = ast ? renderSqlFromAst(ast) : null;
+        if (deterministicSql) {
+            pushGeoRunLog(
+                this,
+                `Deterministic SQL renderer (${taskSpec.plan.target_pattern}): skipping Planner LLM.`
+            );
+            (this as ChainInput & {
+                __geoDeterministicSql?: boolean;
+            }).__geoDeterministicSql = true;
+            const distIdx = dists[0]?.idx ?? 0;
+            return {
+                type: "query",
+                distributionIndex: distIdx,
+                sqlQuery: deterministicSql,
+                context: planContext
+            };
+        }
+        pushGeoRunLog(
+            this,
+            `Deterministic renderer skipped for ${taskSpec.plan.target_pattern} (AST/SQL not built).`
+        );
+    }
+
+    const spatialSql = tryRenderSpatialSql(
+        this.question,
+        taskSpec,
+        plannerPropertyKeys
+    );
+    if (spatialSql) {
+        pushGeoRunLog(
+            this,
+            `Spatial deterministic SQL renderer: skipping Planner LLM.`
+        );
+        (this as ChainInput & {
+            __geoDeterministicSql?: boolean;
+        }).__geoDeterministicSql = true;
+        const distIdx = dists[0]?.idx ?? 0;
+        return {
+            type: "query",
+            distributionIndex: distIdx,
+            sqlQuery: spatialSql,
+            context: planContext
+        };
     }
 
     const executionPlanJson = formatTaskSpecExecutionPlanForPlanner(taskSpec);
@@ -1676,7 +1733,14 @@ export async function queryGeoSpatialWithSQLQuery(
         parserReferenceFeatureFilter ||
         scopeReferenceFeatureFilter ||
         inferReferenceFeatureFilterFromQuestion(this.question, propKeys);
-    if (proximityIntent && referenceFeatureFilter) {
+    const alreadyCompleteSpatialSql = /\bST_DWithin\b|\bST_Distance\b|\bWITH\s+ref\b/i.test(
+        finalSqlQuery
+    );
+    if (
+        proximityIntent &&
+        referenceFeatureFilter &&
+        !alreadyCompleteSpatialSql
+    ) {
         if (
             typeof insertedFeatureCount === "number" &&
             referenceFeatureFilter.localId &&
@@ -1797,7 +1861,8 @@ export async function queryGeoSpatialWithSQLQuery(
     if (spatialContractViolation) {
         const planFallback = buildSqlFromExecutionPlan(
             taskSpecForContract,
-            this.question
+            this.question,
+            propKeys || []
         );
         if (planFallback) {
             finalSqlQuery = normalizeRefPointToken(planFallback);
@@ -1816,7 +1881,10 @@ export async function queryGeoSpatialWithSQLQuery(
             );
         }
     }
-    if (spatialContractViolation) {
+    const usedDeterministicSql = !!(this as ChainInput & {
+        __geoDeterministicSql?: boolean;
+    }).__geoDeterministicSql;
+    if (spatialContractViolation && !usedDeterministicSql) {
         pushGeoRunLog(
             this,
             `Spatial contract violation before execution: ${spatialContractViolation}. Attempting contract-aware rewrite.`

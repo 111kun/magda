@@ -83,11 +83,19 @@ function scalarNumericMatch(
     return true;
 }
 
-/** Column-agnostic row signature: sorted text dims + sorted numeric measures. */
+/** Map-preview columns appended by sanitizer / SQL Console — not part of gold eval answers. */
+function isMapAuxiliaryColumn(key: string): boolean {
+    return /^(geom_wkt|geom_geojson|geojson|wkt)$/i.test((key || "").trim());
+}
+
+/** Row signature: sorted text dims + sorted numeric measures (ignores map-only columns). */
 function rowComparableSignature(row: Record<string, unknown>): string {
     const texts: string[] = [];
     const nums: number[] = [];
-    for (const v of Object.values(row)) {
+    for (const [key, v] of Object.entries(row)) {
+        if (isMapAuxiliaryColumn(key)) {
+            continue;
+        }
         if (v === null || v === undefined) {
             continue;
         }

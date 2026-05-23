@@ -38,6 +38,12 @@ export function matchPropertyKeyFromHint(
 
 export function questionImpliesGroupedBreakdown(question: string): boolean {
     return (
+        /(most\s+(common|frequent|popular|often)|show\s+up\s+most|appear\s+most)/i.test(
+            question
+        ) ||
+        /\bwhich\s+(?:the\s+)?(?:five|ten|\d+|\w+)\b[\s\S]{0,60}\b(?:most|often|frequent|common)\b/i.test(
+            question
+        ) ||
         /(most\s+(common|frequent|popular)|top\s+\d+|top\s+(five|ten|twenty|\d+))/i.test(
             question
         ) ||
@@ -53,14 +59,69 @@ export function questionImpliesGroupedBreakdown(question: string): boolean {
     );
 }
 
-export function questionImpliesRowListing(question: string): boolean {
+/** Tabular row listing — not top-N breakdown nor spatial result column phrasing ("show suburb, …"). */
+export function questionImpliesDataListingIntent(question: string): boolean {
+    const q = (question || "").toLowerCase();
     if (questionImpliesGroupedBreakdown(question)) {
         return false;
     }
+    if (/(how many|number of|count of)/i.test(q)) {
+        return false;
+    }
+    if (/\b(closest|nearest)\b/i.test(q) && /\bshow\b/i.test(q)) {
+        return false;
+    }
+    if (/\bshow\s+up\b/i.test(q)) {
+        return false;
+    }
     return (
-        /\b(list|show|display|find)\s+(the\s+)?(five|ten|\d+|all)\b/i.test(
+        /\b(list|display)\b/i.test(q) ||
+        /\bshow\b(?!\s+up\b)/i.test(q) ||
+        /\bfind\s+(the\s+)?(five|ten|\d+)\b/i.test(q) ||
+        /\blist\s+feature\b/i.test(q)
+    );
+}
+
+export function questionImpliesRowListing(question: string): boolean {
+    return questionImpliesDataListingIntent(question);
+}
+
+/** Scalar COUNT with attribute filter — not GROUP BY (e.g. "how many zones have code R"). */
+export function questionImpliesScalarFilterCount(question: string): boolean {
+    if (!/(how many|number of|count of|多少|几个)/i.test(question)) {
+        return false;
+    }
+    if (questionImpliesGroupedBreakdown(question)) {
+        return false;
+    }
+    if (questionImpliesRowListing(question)) {
+        return false;
+    }
+    if (questionImpliesGeomPredicateCount(question)) {
+        return true;
+    }
+    if (questionImpliesDistinctCardinality(question)) {
+        return true;
+    }
+    if (
+        /(have|with|where|classified|equal|mentions?|labeled|tagged|on\s+a\s+street)/i.test(
             question
-        ) || /\blist\s+feature\b/i.test(question)
+        )
+    ) {
+        return true;
+    }
+    return !/(per|each|by|group|top|most common|breakdown)/i.test(question);
+}
+
+export function questionImpliesSpatialComplex(question: string): boolean {
+    return (
+        /(nearest|closest|within\s+\d+\s*m|metres?\s+of|meters?\s+of|st_dwithin)/i.test(
+            question
+        ) ||
+        /(smaller than|larger than|shorter than|longer than).{0,40}(average|mean)/i.test(
+            question
+        ) ||
+        /(crossing|intersect|inside|contains)\b/i.test(question)
     );
 }
 
@@ -392,16 +453,40 @@ export function inferGroupByKeysFromQuestionEnhanced(
     question: string,
     propertyKeys: string[]
 ): string[] {
+    if (questionImpliesScalarFilterCount(question)) {
+        return [];
+    }
+    if (questionImpliesRowListing(question)) {
+        return [];
+    }
+
     const keys = new Set<string>();
+
+    if (/\bzone\s+codes?\b/i.test(question) && propertyKeys.includes("zone")) {
+        keys.add("zone");
+    }
+    if (
+        /\bdevelopment\s+plan\s+codes?\b/i.test(question) &&
+        propertyKeys.includes("devplan_co")
+    ) {
+        keys.add("devplan_co");
+    }
+    if (
+        /\bdevelopment\s+categor/i.test(question) &&
+        propertyKeys.includes("dev_catego")
+    ) {
+        keys.add("dev_catego");
+    }
 
     const patterns: RegExp[] = [
         /\b(?:group\s+by|grouped\s+by)\s+([a-z0-9_]+)\b/i,
         /\b(?:per|by|each|for\s+each)\s+([a-z0-9_\s]{2,40}?)(?:\s*[,.?]|$)/i,
         /\b(?:in\s+each)\s+([a-z0-9_\s]{2,40}?)(?:\s*[,.?]|$)/i,
         /(?:按|每个|各(?:个)?|每一(?:个)?)([^\s，。]{2,24}?)(?:的|统计|分组|计算|数量)/u,
-        /most\s+(?:common|frequent|popular)\s+([a-z0-9_\s]+?)(?:\s+(?:codes?|categories|types?|by)|[,.?]|$)/i,
+        /most\s+(?:common|frequent|popular|often)\s+([a-z0-9_\s]+?)(?:\s+(?:codes?|categories|types?|by)|[,.?]|$)/i,
         /top\s+(?:five|ten|\d+|\w+)\s+(?:most\s+)?(?:common|frequent)?\s*([a-z0-9_\s]+?)(?:\s+by|[,.?]|$)/i,
-        /\blist\s+(?:the\s+)?(?:five|ten|\d+)\s+(?:most\s+)?(?:common|frequent)\s+([a-z0-9_\s]+?)(?:\s+by|[,.?]|$)/i
+        /\blist\s+(?:the\s+)?(?:five|ten|\d+)\s+(?:most\s+)?(?:common|frequent)\s+([a-z0-9_\s]+?)(?:\s+by|[,.?]|$)/i,
+        /\bwhich\s+(?:five|ten|\d+|\w+)\s+([a-z0-9_\s]+?)\s+(?:show\s+up|appear)\s+most/i
     ];
     for (const re of patterns) {
         const m = question.match(re);
@@ -428,6 +513,20 @@ export function inferGroupByKeysFromQuestionEnhanced(
         ) {
             keys.add(key);
         }
+    }
+    if (
+        /\bzone\s+code\b/i.test(question) &&
+        /(how many|have|with)\b/i.test(question) &&
+        !/(most|top|per|each|group)/i.test(question)
+    ) {
+        keys.delete("zone");
+    }
+
+    if (
+        /tree\s+maintenance\s+areas?|maintenance\s+areas?/i.test(question) &&
+        propertyKeys.includes("treearea")
+    ) {
+        keys.add("treearea");
     }
 
     return [...keys].slice(0, 6);

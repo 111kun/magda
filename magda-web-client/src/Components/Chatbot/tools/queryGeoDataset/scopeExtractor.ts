@@ -3,9 +3,11 @@ import {
     questionImpliesDatasetWideCount,
     questionImpliesGeomMeasurementAggregate,
     questionImpliesGeomPredicateCount,
+    questionImpliesGroupedBreakdown,
     questionImpliesPropertyAttributeAggregate,
     questionImpliesTopologicalSpatial
 } from "./geoQueryQuestionPatterns";
+import { inferSemanticFiltersFromQuestion } from "./columnSemanticHints";
 
 type ValueSamplesByKey = Record<
     string,
@@ -20,7 +22,8 @@ export type ScopeBoundFilter = {
     key: string;
     value: string;
     confidence: number;
-    source: "explicit_key" | "value_sample";
+    source: "explicit_key" | "value_sample" | "semantic_hint";
+    matchOp?: "eq" | "ilike";
 };
 
 export type SpatialIntentDetail = {
@@ -311,6 +314,63 @@ export function questionMentionsValueAsWords(
     return false;
 }
 
+function applySemanticHintsToBoundFilters(
+    question: string,
+    propertyKeys: string[],
+    dedup: Map<string, ScopeBoundFilter>
+): void {
+    const semantic = inferSemanticFiltersFromQuestion(question, propertyKeys);
+    if (!semantic.length) {
+        return;
+    }
+
+    const semKeys = new Set(semantic.map((s) => s.physicalKey));
+    for (const key of [...dedup.keys()]) {
+        const entry = dedup.get(key);
+        if (!entry) {
+            continue;
+        }
+        if (semKeys.has(entry.key)) {
+            dedup.delete(key);
+        }
+    }
+    if (semantic.some((s) => s.physicalKey === "dev_catego")) {
+        for (const key of [...dedup.keys()]) {
+            const entry = dedup.get(key);
+            if (
+                entry &&
+                entry.key !== "dev_catego" &&
+                /^(commercial|residential|open\s*space|industrial)$/i.test(
+                    norm(entry.value)
+                )
+            ) {
+                dedup.delete(key);
+            }
+        }
+    }
+    if (
+        semantic.some((s) => s.physicalKey === "zone_meani" && s.op === "ILIKE")
+    ) {
+        for (const key of [...dedup.keys()]) {
+            const entry = dedup.get(key);
+            if (entry?.key === "zone_meani") {
+                dedup.delete(key);
+            }
+        }
+    }
+
+    for (const sf of semantic) {
+        const mapKey = `${sf.physicalKey}::${norm(sf.value)}`;
+        dedup.set(mapKey, {
+            key: sf.physicalKey,
+            value: sf.value,
+            confidence: 0.96,
+            source: "semantic_hint",
+            matchOp: sf.op === "ILIKE" ? "ilike" : "eq"
+        });
+    }
+}
+
 function detectIntentType(question: string): GeoQueryScope["intentType"] {
     const q = norm(question);
     if (!q) {
@@ -324,11 +384,21 @@ function detectIntentType(question: string): GeoQueryScope["intentType"] {
         return "count";
     }
     if (
-        /(near|nearby|nearest|closest|within|distance|附近|最近|距离|半径|周边)/i.test(
+        /(near|nearby|nearest|closest|distance|附近|最近|距离|半径|周边)/i.test(
             q
-        )
+        ) ||
+        (/within/i.test(q) &&
+            !/within\s+(residential|commercial|industrial|open\s+space|land)\b/i.test(
+                q
+            ) &&
+            /(metres?|meters?|m\b|\d|distance|buffer|radius|of\s+(any|the)\s+)/i.test(
+                q
+            ))
     ) {
         return "spatial";
+    }
+    if (questionImpliesGroupedBreakdown(question)) {
+        return "aggregate";
     }
     if (
         /(which|what)\s+.+\s+(has|have|contains)\s+(the\s+)?(most|least|fewest|more|fewer)/i.test(
@@ -343,10 +413,13 @@ function detectIntentType(question: string): GeoQueryScope["intentType"] {
         return "aggregate";
     }
     if (
-        /(show|list|find|get|where|筛选|过滤|查询|列出|显示|哪些|有哪些)/i.test(
-            q
-        )
+        /(list|find|get|where|筛选|过滤|查询|列出|显示|哪些|有哪些)/i.test(q) &&
+        !/\bshow\s+up\b/i.test(q) &&
+        !/(closest|nearest)\b/.test(q)
     ) {
+        return "list";
+    }
+    if (/\bshow\b/i.test(q) && !/\bshow\s+up\b/i.test(q)) {
         return "list";
     }
     return "unknown";
@@ -606,6 +679,10 @@ export function extractGeoQueryScope(input: {
         );
     }
 
+    applySemanticHintsToBoundFilters(question, input.propertyKeys, dedup);
+    finalBoundFilters = [...dedup.values()];
+    finalBoundFilters = pruneSubsumedBoundFilters(finalBoundFilters, qNorm);
+
     const datasetScopeMentions = (input.datasetScopeTerms || [])
         .map((term) => norm(term))
         .filter(
@@ -622,11 +699,19 @@ export function extractGeoQueryScope(input: {
     const externalLooksBound =
         !!externalPlaceNorm && matchedValueNorms.has(externalPlaceNorm);
     const hasProximityCue = spatialIntent.type !== "none";
-    const needsExternalReference =
+    const hasInternalStreetAnchor =
+        spatialIntent.type === "nearest_neighbor" &&
+        finalBoundFilters.some(
+            (f) => f.key === "street" || f.key === "str_type"
+        );
+    let needsExternalReference =
         hasProximityCue &&
         !!externalPlaceNorm &&
         !externalLooksBound &&
         !datasetScopeMentions.includes(externalPlaceNorm);
+    if (hasInternalStreetAnchor) {
+        needsExternalReference = false;
+    }
 
     reasoningTrace.push(
         needsExternalReference
