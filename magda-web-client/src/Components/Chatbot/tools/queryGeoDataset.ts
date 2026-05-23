@@ -52,12 +52,14 @@ import {
 } from "./queryGeoDataset/scopeExtractor";
 import {
     buildDeterministicTaskSpec,
+    buildSqlFromExecutionPlan,
     formatTaskSpecExecutionPlanForPlanner,
     formatTaskSpecForPlanner,
     GeoQueryTaskSpec,
     resolveGeoQueryTaskSpec
 } from "./queryGeoDataset/geoQueryTaskInterpreter";
 import {
+    extractListRowLimitFromQuestion,
     questionImpliesGeomPredicateCount,
     questionImpliesPropertyAttributeAggregate
 } from "./queryGeoDataset/geoQueryQuestionPatterns";
@@ -162,53 +164,104 @@ function formatGeoReferenceForPlanner(reference: GeoReference | undefined) {
     return `external place=${reference.place}`;
 }
 
-function buildSpatialInstructionFromScope(scope: GeoQueryScope): string {
-    const detail = scope.spatialIntent;
-    if (detail.type === "none") {
-        return "No forced spatial operator family.";
+function buildSpatialInstructionFromPlan(
+    taskSpec: GeoQueryTaskSpec,
+    scope: GeoQueryScope
+): string {
+    const spatial = taskSpec.plan.spatial;
+    if (spatial.mode === "NONE") {
+        return "No forced spatial operator family (plan spatial.mode=NONE).";
     }
-    const lines: string[] = ["[CRITICAL SPATIAL INSTRUCTION]"];
-    if (detail.type === "distance_buffer") {
-        const meters = detail.parameters?.distance_meters;
+    const lines: string[] = [
+        "[CRITICAL SPATIAL INSTRUCTION — from execution plan]"
+    ];
+    lines.push(`spatial.mode=${spatial.mode}`);
+    if (spatial.operator_family_hint) {
+        lines.push(`- Operator family: ${spatial.operator_family_hint}`);
+    }
+    if (spatial.mode === "DISTANCE_BUFFER") {
+        const meters = spatial.parameters?.distance_meters;
         lines.push(
             `- Use ST_DWithin(...) for buffer/distance filtering${
                 meters ? ` with distance=${meters} meters` : ""
             }.`
         );
-        lines.push(
-            "- Do NOT replace it with plain ST_Distance < x unless unavoidable."
-        );
-    } else if (detail.type === "nearest_neighbor") {
-        const limit = detail.parameters?.limit || 1;
+    } else if (spatial.mode === "NEAREST_K") {
+        const k = spatial.parameters?.k ?? 1;
         lines.push(
             "- Use KNN nearest-neighbor ordering: ORDER BY geom <-> target_geom."
         );
-        lines.push(`- MUST include LIMIT ${limit}.`);
-    } else if (detail.type === "topological") {
+        lines.push(`- MUST include LIMIT ${k}.`);
+    } else if (spatial.mode === "TOPOLOGY") {
         lines.push(
             "- Use topological predicates: ST_Intersects / ST_Contains / ST_Within as appropriate."
         );
-    } else if (detail.type === "measurement") {
+    } else if (spatial.mode === "MEASURE") {
         lines.push(
-            "- Use spatial measurement functions: ST_Area / ST_Length / ST_Perimeter (polygons) with correct units."
+            "- Use SUM/AVG/MIN/MAX on ST_Area / ST_Length / ST_Perimeter per plan operations — never COUNT(*)."
         );
+    } else if (spatial.mode === "GEOM_PREDICATE") {
         lines.push(
-            "- For polygon features stored as MultiPolygon, perimeter uses ST_Perimeter(geom::geography); length along a centerline uses ST_Length."
+            "- WHERE must use geometry predicates: ST_IsValid / ST_Length / ST_Perimeter / ST_Area / NOT ST_IsValid as in the question."
         );
     }
+    const anchor = scope.spatialIntent.anchor;
+    if (anchor?.type === "internal_feature") {
+        lines.push(
+            `- Anchor "${anchor.value}" is internal; use CTE/subquery from features, not external geocoding.`
+        );
+    } else if (anchor?.type === "external_poi") {
+        lines.push(
+            `- Anchor "${anchor.value}" is external; resolve as placeName and use __REF_POINT__.`
+        );
+    }
+    return lines.join("\n");
+}
 
-    if (detail.anchor?.type === "internal_feature") {
+function buildPlanContractInstruction(
+    scope: GeoQueryScope,
+    taskSpec: GeoQueryTaskSpec,
+    question: string
+): string {
+    const p = taskSpec.plan;
+    const lines: string[] = [
+        "[CRITICAL PLAN CONTRACT]",
+        `target_pattern=${p.target_pattern}`,
+        `spatial.mode=${p.spatial.mode}`,
+        `operations=${p.operations.map((o) => o.operator).join("; ")}`
+    ];
+    if (p.target_pattern === "MEASUREMENT") {
         lines.push(
-            `- Anchor "${detail.anchor.value}" is internal; use CTE/subquery from features, not external geocoding.`
+            "- MEASUREMENT: use SUM/AVG/MIN/MAX on ST_Area/ST_Length/ST_Perimeter (or property aggregate from operations).",
+            "- Do NOT use COUNT(*) or COUNT(*) WHERE TRUE as the answer."
         );
-    } else if (detail.anchor?.type === "external_poi") {
+    }
+    if (
+        p.target_pattern === "AGGREGATE_GROUP_BY" &&
+        p.spatial.mode === "NONE"
+    ) {
         lines.push(
-            `- Anchor "${detail.anchor.value}" is external; resolve as placeName and use __REF_POINT__.`
+            "- Attribute-only GROUP BY: use bound filters and GROUP BY keys; do NOT add ST_Within/ST_Intersects unless spatial.mode changes."
         );
-    } else if (detail.anchor?.type === "implicit_bounds") {
+    }
+    if (p.target_pattern === "LIST_ROWS") {
+        const limit = extractListRowLimitFromQuestion(question);
         lines.push(
-            "- Anchor is implicit viewport bounds; if bounds are provided, use envelope-based spatial filter."
+            "- LIST_ROWS: SELECT multiple columns (id + properties + optional ST_AsText(geom)).",
+            limit
+                ? `- MUST include LIMIT ${limit}.`
+                : "- MUST include LIMIT N (infer from question if numeric)."
         );
+        if (
+            /\b(sort|sorted|order|ascending|descending|highest|lowest|top|largest|smallest)\b/i.test(
+                question
+            )
+        ) {
+            lines.push("- Include ORDER BY when sort wording is present.");
+        }
+    }
+    if (p.spatial.mode !== "NONE") {
+        lines.push(buildSpatialInstructionFromPlan(taskSpec, scope));
     }
     return lines.join("\n");
 }
@@ -253,50 +306,144 @@ function buildCountInstructionFromScope(
     ].join("\n");
 }
 
+function getMeasurementContractViolation(
+    sql: string,
+    taskSpec?: GeoQueryTaskSpec
+): string | null {
+    if (taskSpec?.plan.target_pattern !== "MEASUREMENT") {
+        return null;
+    }
+    const query = sql || "";
+    if (/\bcount\s*\(\s*\*\s*\)/i.test(query)) {
+        return "MEASUREMENT plan forbids COUNT(*); use SUM/AVG/MIN/MAX on ST_Area/ST_Length/ST_Perimeter per operations";
+    }
+    const hasScalarAgg = /\b(sum|avg|min|max)\s*\(/i.test(query);
+    const hasGeomFn = /st_(area|length|perimeter)\s*\(/i.test(query);
+    const hasPropAgg = taskSpec.plan.operations.some((o) =>
+        /^(SUM|AVG|MIN|MAX)\(/i.test(o.operator)
+    );
+    if (!hasScalarAgg && !hasGeomFn && !hasPropAgg) {
+        return "MEASUREMENT query must include SUM/AVG/MIN/MAX(ST_Area|Length|Perimeter) or planned property aggregate";
+    }
+    return null;
+}
+
+function getGeomPredicateContractViolation(
+    sql: string,
+    taskSpec?: GeoQueryTaskSpec,
+    question?: string
+): string | null {
+    const mode = taskSpec?.plan.spatial.mode;
+    const pattern = taskSpec?.plan.target_pattern;
+    const q = question || "";
+    const needs =
+        mode === "GEOM_PREDICATE" ||
+        (pattern === "FILTER_COUNT" && questionImpliesGeomPredicateCount(q));
+    if (!needs) {
+        return null;
+    }
+    const query = sql || "";
+    if (
+        !/st_(isvalid|length|perimeter|area)\s*\(/i.test(query) &&
+        !/not\s+st_isvalid\s*\(/i.test(query)
+    ) {
+        return "geom_predicate query must use ST_IsValid/ST_Length/ST_Perimeter/ST_Area in WHERE";
+    }
+    return null;
+}
+
+function getListRowsContractViolation(
+    sql: string,
+    taskSpec?: GeoQueryTaskSpec,
+    question?: string
+): string | null {
+    if (taskSpec?.plan.target_pattern !== "LIST_ROWS") {
+        return null;
+    }
+    const query = sql || "";
+    if (!/\blimit\s+\d+\b/i.test(query)) {
+        const expected = extractListRowLimitFromQuestion(question || "");
+        return expected
+            ? `LIST_ROWS query must include LIMIT ${expected}`
+            : "LIST_ROWS query must include LIMIT";
+    }
+    if (
+        /^\s*select\s+count\s*\(/i.test(query.replace(/\s+/g, " ").trim()) &&
+        !/properties\s*->>/i.test(query)
+    ) {
+        return "LIST_ROWS must not be a scalar COUNT(*) query";
+    }
+    const selectBody = query.match(/select\s+([\s\S]+?)\s+from\s+features/i);
+    if (selectBody) {
+        const cols = selectBody[1]
+            .split(",")
+            .map((c) => c.trim())
+            .filter((c) => c && !/^\*$/i.test(c));
+        if (cols.length < 2) {
+            return "LIST_ROWS should SELECT at least two columns (e.g. id and properties)";
+        }
+    }
+    if (
+        /\b(sort|sorted|order by|ascending|descending|highest|lowest|top|largest|smallest)\b/i.test(
+            question || ""
+        ) &&
+        !/\border\s+by\b/i.test(query)
+    ) {
+        return "LIST_ROWS with sort wording must include ORDER BY";
+    }
+    return null;
+}
+
 function getSpatialContractViolation(
     sql: string,
     scope: GeoQueryScope,
     taskSpec?: GeoQueryTaskSpec,
     question?: string
 ): string | null {
-    const detail = scope.spatialIntent;
-    if (detail.type === "none") {
+    const q = question || "";
+    const pattern = taskSpec?.plan.target_pattern;
+    const spatialMode = taskSpec?.plan.spatial.mode ?? "NONE";
+    const query = sql || "";
+
+    const measurementViolation = getMeasurementContractViolation(sql, taskSpec);
+    if (measurementViolation) {
+        return measurementViolation;
+    }
+
+    const listViolation = getListRowsContractViolation(sql, taskSpec, q);
+    if (listViolation) {
+        return listViolation;
+    }
+
+    const geomViolation = getGeomPredicateContractViolation(sql, taskSpec, q);
+    if (geomViolation) {
+        return geomViolation;
+    }
+
+    if (pattern === "AGGREGATE_GROUP_BY" && spatialMode === "NONE") {
         return null;
     }
-    const q = question || "";
-    if (detail.type === "measurement") {
-        if (
-            taskSpec?.plan.target_pattern === "FILTER_COUNT" &&
-            questionImpliesGeomPredicateCount(q)
-        ) {
-            return null;
-        }
-        if (questionImpliesPropertyAttributeAggregate(q)) {
-            return null;
-        }
-        if (
-            taskSpec?.plan.operations.some((o) =>
-                /^(SUM|AVG|MIN|MAX)\(/i.test(o.operator)
-            )
-        ) {
-            return null;
-        }
+    if (pattern === "LIST_ROWS" && spatialMode === "NONE") {
+        return null;
     }
-    const query = sql || "";
-    if (detail.type === "distance_buffer") {
+    if (spatialMode === "NONE") {
+        return null;
+    }
+
+    if (spatialMode === "DISTANCE_BUFFER") {
         if (!/st_dwithin\s*\(/i.test(query)) {
             return "distance_buffer query must use ST_DWithin(...)";
         }
         return null;
     }
-    if (detail.type === "nearest_neighbor") {
+    if (spatialMode === "NEAREST_K") {
         if (!/order\s+by[\s\S]{0,200}<->/i.test(query)) {
             return "nearest_neighbor query must use ORDER BY ... <-> ...";
         }
         if (!/\blimit\s+\d+\b/i.test(query)) {
             return "nearest_neighbor query must include LIMIT";
         }
-        const expectedLimit = detail.parameters?.limit;
+        const expectedLimit = taskSpec?.plan.spatial.parameters?.k;
         if (expectedLimit) {
             const match = query.match(/\blimit\s+(\d+)\b/i);
             const actual = match?.[1] ? Number(match[1]) : undefined;
@@ -306,16 +453,26 @@ function getSpatialContractViolation(
         }
         return null;
     }
-    if (detail.type === "topological") {
+    if (spatialMode === "TOPOLOGY") {
         if (!/st_(intersects|contains|within)\s*\(/i.test(query)) {
             return "topological query must use ST_Intersects/ST_Contains/ST_Within";
         }
         return null;
     }
-    if (detail.type === "measurement") {
-        if (!/st_(area|length|perimeter)\s*\(/i.test(query)) {
-            return "measurement query must use ST_Area/ST_Length/ST_Perimeter";
+    if (spatialMode === "MEASURE") {
+        if (
+            !/st_(area|length|perimeter)\s*\(/i.test(query) &&
+            !/\b(sum|avg|min|max)\s*\(/i.test(query)
+        ) {
+            return "measurement query must use ST_Area/ST_Length/ST_Perimeter with SUM/AVG/MIN/MAX";
         }
+        return null;
+    }
+
+    if (
+        questionImpliesPropertyAttributeAggregate(q) &&
+        pattern === "FILTER_COUNT"
+    ) {
         return null;
     }
     return null;
@@ -509,6 +666,9 @@ export async function planGeoSqlQuery(
         "- Polygon/MultiPolygon perimeter: prefer ST_Perimeter(geom::geography) in meters; do not use ST_Length for closed polygon boundaries unless the question asks for a polyline length.",
         "- If `spatial.needs_external_geocode` is true, set `placeName` and use `__REF_POINT__` in sqlQuery; for internal anchors use CTE/subquery per reference note, not invented coordinates.",
         "- LIST_ROWS / multi-row answers: include needed columns; optional `ST_AsText(geom) AS geom_wkt` for map preview.",
+        "- LIST_ROWS: always include LIMIT; add ORDER BY when the question implies sorting.",
+        "- MEASUREMENT: implement `operations` with SUM/AVG/MIN/MAX on ST_Area/ST_Length/ST_Perimeter (or property aggregate). Never use COUNT(*) for MEASUREMENT.",
+        "- AGGREGATE_GROUP_BY with spatial.mode NONE: attribute filters + GROUP BY only; do not add ST_Within/ST_Intersects.",
         "",
         "## Output",
         "Return **ONLY** raw JSON (no markdown).",
@@ -1635,6 +1795,28 @@ export async function queryGeoSpatialWithSQLQuery(
         this.question
     );
     if (spatialContractViolation) {
+        const planFallback = buildSqlFromExecutionPlan(
+            taskSpecForContract,
+            this.question
+        );
+        if (planFallback) {
+            finalSqlQuery = normalizeRefPointToken(planFallback);
+            pushGeoRunLog(
+                this,
+                formatGeoSqlLog(
+                    "GeoSQL from deterministic plan fallback",
+                    finalSqlQuery
+                )
+            );
+            spatialContractViolation = getSpatialContractViolation(
+                finalSqlQuery,
+                scope,
+                taskSpecForContract,
+                this.question
+            );
+        }
+    }
+    if (spatialContractViolation) {
         pushGeoRunLog(
             this,
             `Spatial contract violation before execution: ${spatialContractViolation}. Attempting contract-aware rewrite.`
@@ -1642,9 +1824,11 @@ export async function queryGeoSpatialWithSQLQuery(
         const contractRepaired = await repairGeoSqlWithModel(
             this,
             finalSqlQuery,
-            `${buildSpatialInstructionFromScope(
-                scope
-            )}\n\n[NON-NEGOTIABLE]\n- Rewrite SQL to satisfy the required spatial operator family and parameters.\n- Keep all existing bound attribute filters.\n- Return SQL only.`,
+            `${buildPlanContractInstruction(
+                scope,
+                taskSpecForContract,
+                this.question
+            )}\n\n[NON-NEGOTIABLE]\n- Rewrite SQL to satisfy target_pattern, spatial.mode, and operations from the plan.\n- Keep all existing bound attribute filters.\n- Return SQL only.`,
             propKeys,
             metadataBrief,
             schemaContext

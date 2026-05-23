@@ -6,7 +6,7 @@ import { Runnable, RunnableLambda } from "@langchain/core/runnables";
 import ChatEvalOpenAi, { ChatEvalOpenAiInputs } from "./ChatEvalOpenAi";
 import ChatWebLLM, { mergeWebLLMChatOptions, WebLLMInputs } from "./ChatWebLLM";
 import type { MagdaLlmModel } from "./magdaLlmModel";
-import { webLlmResetChat } from "./webLlmSerial";
+import { webLlmResetChat, webLlmUnloadEngine } from "./webLlmSerial";
 import AsyncQueue from "@ai-zen/async-queue";
 import {
     CommonInputType,
@@ -74,7 +74,7 @@ class AgentChain {
         }
     }
     /** GeoSQL eval: dedicated AgentChain instance (optional OpenAI backend). */
-    static createForEval(
+    static async createForEval(
         appName: string,
         navLocation: Location,
         navHistory: History,
@@ -83,7 +83,16 @@ class AgentChain {
         loadProgressCallback?: InitProgressCallback,
         errorHandler?: (e) => void,
         options?: AgentChainCreateOptions
-    ): AgentChain {
+    ): Promise<AgentChain> {
+        const prev = AgentChain.agentChain;
+        if (prev?.model instanceof ChatWebLLM) {
+            try {
+                const eng = await prev.model.getEngine();
+                await webLlmUnloadEngine(eng);
+            } catch {
+                /* prior engine not loaded */
+            }
+        }
         AgentChain.agentChain = null;
         if (loadProgressCallback) {
             AgentChain.llmLoadProgressCallbacks.push(loadProgressCallback);

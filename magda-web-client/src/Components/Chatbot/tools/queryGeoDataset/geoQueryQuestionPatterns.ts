@@ -77,8 +77,13 @@ export function questionImpliesPropertyAttributeAggregate(
     question: string
 ): boolean {
     const q = question.toLowerCase();
+    if (
+        /\b(shape_area|shape_leng)\b/i.test(question) &&
+        /\b(total|sum|average|avg|typical|min|max|value)\b/i.test(q)
+    ) {
+        return true;
+    }
     const mentionsPropertyField =
-        /\b(shape_area|shape_leng)\b/.test(q) ||
         /(sum|total|average|avg|min|max)\s+(the\s+)?[a-z0-9_]+\s+property\b/i.test(
             question
         ) ||
@@ -86,23 +91,274 @@ export function questionImpliesPropertyAttributeAggregate(
             question
         );
     const mentionsGeomMetric =
-        /(geodesic|geometry|geometries|geom\b|st_|perimeter|周长)/i.test(
+        /(geodesic|geometry|geometries|geom\b|st_|perimeter|周长|footprint)/i.test(
             question
         ) ||
-        /(total|sum|avg).{0,25}(area|length|perimeter).{0,25}(of all|combined|all features)/i.test(
+        (/(\bof all\b|\bcombined\b|\ball polygons\b|\ball features\b)/i.test(
             question
-        );
+        ) &&
+            /(area|length|perimeter|square metres?|square meters?)/i.test(
+                question
+            ) &&
+            !/\b(shape_area|shape_leng)\b/i.test(question));
     return mentionsPropertyField && !mentionsGeomMetric;
 }
 
-/** COUNT with geom predicate in WHERE (e.g. perimeter > 50m, ST_IsValid) — not a geom measurement aggregate. */
-export function questionImpliesGeomPredicateCount(question: string): boolean {
+/**
+ * Scalar geom metric (SUM/AVG/MIN/MAX of ST_Area/Length/Perimeter), not "how many".
+ */
+export function questionImpliesGeomMeasurementAggregate(
+    question: string
+): boolean {
+    if (/(how many|number of|count of|多少|几个)/i.test(question)) {
+        return false;
+    }
+    if (questionImpliesPropertyAttributeAggregate(question)) {
+        return false;
+    }
+    const q = question.toLowerCase();
     return (
-        /(how many|number of|count of|多少|几个)/i.test(question) &&
-        /(perimeter|length|area|geodesic|st_|valid|geometry|geometries|geom\b|周长|面积)/i.test(
-            question
+        /\b(what is|what's|total|combined|sum of|average|typical|largest|smallest|longest|shortest|maximum|minimum|max|min|avg)\b/i.test(
+            q
+        ) &&
+        /\b(area|length|perimeter|footprint|square metres?|square meters?|polygon size)\b/i.test(
+            q
         )
     );
+}
+
+/** COUNT with geom predicate in WHERE (e.g. perimeter > 50m, ST_IsValid) — not a scalar measurement. */
+export function questionImpliesGeomPredicateCount(question: string): boolean {
+    if (!/(how many|number of|count of|多少|几个)/i.test(question)) {
+        return false;
+    }
+    if (questionImpliesGeomMeasurementAggregate(question)) {
+        return false;
+    }
+    if (questionImpliesAttributeWithinPhrase(question)) {
+        return false;
+    }
+    const q = question.toLowerCase();
+    if (
+        /(development areas?|classified as|zone code|open space|commercial|residential|geometry type|each geometry)/i.test(
+            q
+        ) &&
+        !/(st_|valid|invalid|larger than|smaller than|longer than|shorter than|\d+\s*(m|metres?|meters?))/i.test(
+            q
+        )
+    ) {
+        return false;
+    }
+    if (/(valid|invalid).{0,30}(geometr|geom|polygon)/i.test(q)) {
+        return true;
+    }
+    if (
+        /(perimeter|length).{0,50}(above|below|greater|less|longer|shorter|>|\d+\s*(m|metres?|meters?))/i.test(
+            q
+        )
+    ) {
+        return true;
+    }
+    if (
+        /(larger|smaller|bigger).{0,40}(square metres?|square meters?|\d{4,})/i.test(
+            q
+        ) &&
+        /(polygon|geograph|footprint)/i.test(q)
+    ) {
+        return true;
+    }
+    if (
+        /(above|below|than).{0,30}(average|mean)/i.test(q) &&
+        /(perimeter|length|area)/i.test(q)
+    ) {
+        return true;
+    }
+    if (
+        /(valid|st_isvalid)/i.test(q) &&
+        /(length|perimeter).{0,40}(above|>|greater|\d+)/i.test(q)
+    ) {
+        return true;
+    }
+    return false;
+}
+
+/** Whole-table cardinality (no attribute filter), e.g. "how many trees are in this dataset". */
+export function questionImpliesDatasetWideCount(question: string): boolean {
+    const q = (question || "").toLowerCase().trim();
+    if (!/(how many|number of|count of|总数|多少|几个)/i.test(q)) {
+        return false;
+    }
+    if (
+        /\b(classified as|listed for|labeled as|where|with|having|equals|equal to|perimeter|valid|invalid|larger than|smaller than|longer than|shorter than|near|within\s+\d)/i.test(
+            q
+        )
+    ) {
+        return false;
+    }
+    return (
+        /\b(in this dataset|in the dataset|in this layer|in the layer|in the table|are in this|polygons are in|trees are in|features are in|records in this|segments are in)\b/i.test(
+            q
+        ) ||
+        /\bhow many\s+(?:[a-z]+\s+){0,4}(?:features?|records?|polygons?|trees?|segments?)\s+(?:are\s+)?(?:there\s+)?in\b/i.test(
+            q
+        )
+    );
+}
+
+/** PostGIS operators for COUNT/WHERE on geometry (not scalar ST_Area aggregate). */
+export function inferGeomPredicateOperatorFamily(
+    question: string
+): ("ST_IsValid" | "ST_Length" | "ST_Perimeter" | "ST_Area" | "ST_DWithin")[] {
+    const q = (question || "").toLowerCase();
+    const ops: (
+        | "ST_IsValid"
+        | "ST_Length"
+        | "ST_Perimeter"
+        | "ST_Area"
+        | "ST_DWithin"
+    )[] = [];
+    if (/(invalid|not valid)/i.test(q)) {
+        ops.push("ST_IsValid");
+    } else if (
+        /\bvalid\b/i.test(q) &&
+        /(geometr|geom|segment|polygon|road|features?)/i.test(q)
+    ) {
+        ops.push("ST_IsValid");
+    }
+    if (/(perimeter|周长)/i.test(q)) {
+        ops.push("ST_Perimeter");
+    }
+    if (
+        /(length|longer than|shorter than|metres?|meters?)/i.test(q) &&
+        !/(perimeter|周长)/i.test(q)
+    ) {
+        ops.push("ST_Length");
+    }
+    if (
+        /(area|square metres?|square meters?|larger than|smaller than)/i.test(q)
+    ) {
+        ops.push("ST_Area");
+    }
+    return [...new Set(ops)];
+}
+
+/**
+ * "Within residential land" / "within commercial zones" = attribute filter wording,
+ * not PostGIS ST_Within topology.
+ */
+export function questionImpliesAttributeWithinPhrase(
+    question: string
+): boolean {
+    const q = (question || "").toLowerCase();
+    return (
+        /\bwithin\s+(?:the\s+)?(?:(?:residential|commercial|industrial|mixed)\s+(?:land|zones?|areas?)|land\s+use)\b/i.test(
+            q
+        ) ||
+        /\bwithin\s+(?:the\s+)?(?:residential|commercial|industrial)\b/i.test(q)
+    );
+}
+
+/** True when the user asks for geometric topology (intersects / contains / inside), not attribute "within X". */
+export function questionImpliesTopologicalSpatial(question: string): boolean {
+    const q = (question || "").toLowerCase();
+    if (questionImpliesAttributeWithinPhrase(question)) {
+        return false;
+    }
+    if (/\bwithin\s+\d+/i.test(q)) {
+        return false;
+    }
+    return (
+        /\b(intersect|intersects|intersection|overlap|inside|contains|contained)\b/i.test(
+            q
+        ) ||
+        /\bwithin\s+(?:the\s+)?(?:area|region|boundary|polygon|geometry|map|viewport)\b/i.test(
+            q
+        )
+    );
+}
+
+/** LIMIT N from "show ten", "list five", "top 10", etc. */
+export function extractListRowLimitFromQuestion(
+    question: string
+): number | undefined {
+    const q = (question || "").trim();
+    const patterns = [
+        /\b(?:show|list|display|find)\s+(?:the\s+)?(five|ten|twenty|\d+)\b/i,
+        /\b(?:top|first|nearest)\s+(\d+)\b/i,
+        /\b(\d+)\s+(?:rows?|records?|features?|items?|trees?|segments?)\b/i
+    ];
+    const wordToNum: Record<string, number> = {
+        five: 5,
+        ten: 10,
+        twenty: 20
+    };
+    for (const re of patterns) {
+        const m = q.match(re);
+        const raw = m?.[1]?.toLowerCase();
+        if (!raw) {
+            continue;
+        }
+        const n =
+            wordToNum[raw] ??
+            (Number.isInteger(Number(raw)) ? Number(raw) : NaN);
+        if (Number.isFinite(n) && n > 0) {
+            return Math.min(n, 100);
+        }
+    }
+    return undefined;
+}
+
+export function inferScalarAggregateFnFromQuestion(
+    question: string
+): "SUM" | "AVG" | "MIN" | "MAX" {
+    const q = (question || "").toLowerCase();
+    if (/\b(total|combined|sum)\b/.test(q)) {
+        return "SUM";
+    }
+    if (/\b(largest|maximum|max|longest)\b/.test(q)) {
+        return "MAX";
+    }
+    if (/\b(smallest|minimum|min|shortest)\b/.test(q)) {
+        return "MIN";
+    }
+    if (/\b(average|avg|typical|mean|median)\b/.test(q)) {
+        return "AVG";
+    }
+    return "AVG";
+}
+
+/** MEASUREMENT on geometry: SUM/AVG/MIN/MAX(ST_Area|Length|Perimeter(geom::geography)). */
+export function inferGeomMeasurementOperation(
+    question: string
+): { operator: string; alias: string } | null {
+    const q = (question || "").toLowerCase();
+    if (
+        !/(area|length|perimeter|footprint|size|metres?|meters?|square)/i.test(
+            q
+        )
+    ) {
+        return null;
+    }
+    const fn = inferScalarAggregateFnFromQuestion(question);
+    if (/(perimeter|周长)/i.test(q)) {
+        return {
+            operator: `${fn}(ST_Perimeter(geom::geography))`,
+            alias: `${fn.toLowerCase()}_perim_m`
+        };
+    }
+    if (
+        /(length|longer|shorter|segment length)/i.test(q) &&
+        !/(area|footprint|square)/i.test(q)
+    ) {
+        return {
+            operator: `${fn}(ST_Length(geom::geography))`,
+            alias: `${fn.toLowerCase()}_len_m`
+        };
+    }
+    return {
+        operator: `${fn}(ST_Area(geom::geography))`,
+        alias: `${fn.toLowerCase()}_area_m2`
+    };
 }
 
 export function inferDistinctCountKey(

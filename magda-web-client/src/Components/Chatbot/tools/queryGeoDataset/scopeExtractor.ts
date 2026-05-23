@@ -1,6 +1,10 @@
 import {
+    inferGeomPredicateOperatorFamily,
+    questionImpliesDatasetWideCount,
+    questionImpliesGeomMeasurementAggregate,
     questionImpliesGeomPredicateCount,
-    questionImpliesPropertyAttributeAggregate
+    questionImpliesPropertyAttributeAggregate,
+    questionImpliesTopologicalSpatial
 } from "./geoQueryQuestionPatterns";
 
 type ValueSamplesByKey = Record<
@@ -25,7 +29,8 @@ export type SpatialIntentDetail = {
         | "topological"
         | "distance_buffer"
         | "nearest_neighbor"
-        | "measurement";
+        | "measurement"
+        | "geom_predicate";
     operatorFamily?: (
         | "ST_DWithin"
         | "KNN_<->"
@@ -35,6 +40,7 @@ export type SpatialIntentDetail = {
         | "ST_Area"
         | "ST_Length"
         | "ST_Perimeter"
+        | "ST_IsValid"
     )[];
     parameters?: {
         distance_meters?: number;
@@ -184,6 +190,92 @@ function shouldSkipValueSampleBinding(valueNorm: string): boolean {
     return false;
 }
 
+/** Key name appears as a bare word in the question (e.g. key `street` + "street trees"). */
+function questionMentionsPropertyKeyAsWord(
+    propertyKey: string,
+    qNorm: string,
+    qTokens: string[]
+): boolean {
+    const keyPhrase = norm(propertyKey).replace(/_/g, " ");
+    const keyTokens = tokenizeQuestion(keyPhrase);
+    if (keyTokens.length === 1) {
+        return qTokens.includes(keyTokens[0]);
+    }
+    if (keyTokens.length >= 2) {
+        return questionMentionsValueAsWords(qNorm, keyPhrase);
+    }
+    return false;
+}
+
+function valueSampleTokenCount(valueNorm: string): number {
+    return tokenizeQuestion(valueNorm).length;
+}
+
+type TokenSpan = { start: number; len: number };
+
+function findValueTokenSpan(
+    qTokens: string[],
+    valueNorm: string
+): TokenSpan | null {
+    const valueTokens = tokenizeQuestion(valueNorm);
+    if (!valueTokens.length) {
+        return null;
+    }
+    if (valueTokens.length === 1) {
+        const idx = qTokens.indexOf(valueTokens[0]);
+        return idx >= 0 ? { start: idx, len: 1 } : null;
+    }
+    const n = valueTokens.length;
+    for (let i = 0; i <= qTokens.length - n; i++) {
+        let matched = true;
+        for (let j = 0; j < n; j++) {
+            if (qTokens[i + j] !== valueTokens[j]) {
+                matched = false;
+                break;
+            }
+        }
+        if (matched) {
+            return { start: i, len: n };
+        }
+    }
+    return null;
+}
+
+function isStrictSubSpan(inner: TokenSpan, outer: TokenSpan): boolean {
+    return (
+        inner.len < outer.len &&
+        inner.start >= outer.start &&
+        inner.start + inner.len <= outer.start + outer.len
+    );
+}
+
+/** Drop shorter value bindings whose tokens are subsumed by a longer phrase (e.g. Doncaster vs Doncaster East). */
+function pruneSubsumedBoundFilters(
+    filters: ScopeBoundFilter[],
+    qNorm: string
+): ScopeBoundFilter[] {
+    const qTokens = tokenizeQuestion(qNorm);
+    const withSpan = filters
+        .map((f) => ({
+            f,
+            span: findValueTokenSpan(qTokens, norm(f.value))
+        }))
+        .sort((a, b) => (b.span?.len || 0) - (a.span?.len || 0));
+
+    const kept: typeof withSpan = [];
+    for (const item of withSpan) {
+        if (!item.span) {
+            kept.push(item);
+            continue;
+        }
+        if (kept.some((k) => k.span && isStrictSubSpan(item.span!, k.span!))) {
+            continue;
+        }
+        kept.push(item);
+    }
+    return kept.map((x) => x.f);
+}
+
 export function questionMentionsValueAsWords(
     qNorm: string,
     valueNorm: string
@@ -313,16 +405,33 @@ function classifySpatialIntent(question: string): SpatialIntentDetail {
     const limit = extractLimit(question);
     const hasNearest =
         /(nearest|closest|最近|最近的|离我最近)/i.test(q) || !!limit;
-    const hasTopo = /(intersect|intersects|inside|within(?!\s*\d)|contain|contains|相交|包含|在.*里面|在.*内)/i.test(
-        q
-    );
-    const hasMeasure = /(area|length|面积|多大|有多长|周长)/i.test(q);
+    const hasTopo = questionImpliesTopologicalSpatial(question);
+    const hasMeasure =
+        /\b(area|length|footprint|perimeter|周长)\b/i.test(q) ||
+        /\b(square metres?|square meters?)\b/i.test(q);
 
-    if (questionImpliesGeomPredicateCount(question)) {
-        return { type: "none" };
-    }
     if (questionImpliesPropertyAttributeAggregate(question)) {
         return { type: "none" };
+    }
+    if (questionImpliesGeomMeasurementAggregate(question)) {
+        const operatorFamily: NonNullable<
+            SpatialIntentDetail["operatorFamily"]
+        > = /(perimeter|周长)/i.test(question)
+            ? ["ST_Perimeter", "ST_Area", "ST_Length"]
+            : ["ST_Area", "ST_Length", "ST_Perimeter"];
+        return {
+            type: "measurement",
+            operatorFamily
+        };
+    }
+    if (questionImpliesGeomPredicateCount(question)) {
+        const operatorFamily = inferGeomPredicateOperatorFamily(question);
+        return {
+            type: "geom_predicate",
+            operatorFamily: operatorFamily.length
+                ? operatorFamily
+                : ["ST_IsValid", "ST_Length", "ST_Perimeter"]
+        };
     }
     if (hasMeasure) {
         const operatorFamily: NonNullable<
@@ -371,9 +480,22 @@ export function extractGeoQueryScope(input: {
     reasoningTrace.push(`intent=${intentType}`);
     const spatialIntent = classifySpatialIntent(question);
     reasoningTrace.push(`spatial_intent=${spatialIntent.type}`);
+    if (
+        spatialIntent.type === "geom_predicate" &&
+        spatialIntent.operatorFamily?.length
+    ) {
+        reasoningTrace.push(
+            `geom_predicate_ops=${spatialIntent.operatorFamily.join(",")}`
+        );
+    }
 
     const boundFilters: ScopeBoundFilter[] = [];
     const matchedValueNorms = new Set<string>();
+    const qTokens = tokenizeQuestion(qNorm);
+    const skipValueSampleBinding = questionImpliesDatasetWideCount(question);
+    if (skipValueSampleBinding) {
+        reasoningTrace.push("value_sample_skipped=dataset_wide_count");
+    }
 
     for (const key of input.propertyKeys || []) {
         const keyNorm = norm(key);
@@ -409,30 +531,61 @@ export function extractGeoQueryScope(input: {
         }
     }
 
-    Object.entries(input.valueSamplesByKey || {}).forEach(([key, profile]) => {
-        for (const rawValue of profile?.values || []) {
-            const valueNorm = norm(rawValue);
-            if (!valueNorm || matchedValueNorms.has(valueNorm)) {
-                continue;
-            }
-            if (
-                !shouldSkipValueSampleBinding(valueNorm) &&
-                questionMentionsValueAsWords(qNorm, valueNorm)
-            ) {
-                boundFilters.push({
-                    key,
-                    value: rawValue,
-                    confidence: profile.mode === "full" ? 0.9 : 0.72,
-                    source: "value_sample"
-                });
-                matchedValueNorms.add(valueNorm);
-                reasoningTrace.push(
-                    `value_sample_word_match:${key}=${rawValue}`
+    if (!skipValueSampleBinding) {
+        Object.entries(input.valueSamplesByKey || {}).forEach(
+            ([key, profile]) => {
+                const sortedValues = [...(profile?.values || [])].sort(
+                    (a, b) =>
+                        valueSampleTokenCount(norm(b)) -
+                        valueSampleTokenCount(norm(a))
                 );
-                break;
+                let bestMatch: {
+                    rawValue: string;
+                    valueNorm: string;
+                    tokenCount: number;
+                } | null = null;
+
+                for (const rawValue of sortedValues) {
+                    const valueNorm = norm(rawValue);
+                    if (!valueNorm || matchedValueNorms.has(valueNorm)) {
+                        continue;
+                    }
+                    if (shouldSkipValueSampleBinding(valueNorm)) {
+                        continue;
+                    }
+                    if (!questionMentionsValueAsWords(qNorm, valueNorm)) {
+                        continue;
+                    }
+                    const tokenCount = valueSampleTokenCount(valueNorm);
+                    if (
+                        questionMentionsPropertyKeyAsWord(
+                            key,
+                            qNorm,
+                            qTokens
+                        ) &&
+                        tokenCount === 1
+                    ) {
+                        continue;
+                    }
+                    bestMatch = { rawValue, valueNorm, tokenCount };
+                    break;
+                }
+
+                if (bestMatch) {
+                    boundFilters.push({
+                        key,
+                        value: bestMatch.rawValue,
+                        confidence: profile.mode === "full" ? 0.9 : 0.72,
+                        source: "value_sample"
+                    });
+                    matchedValueNorms.add(bestMatch.valueNorm);
+                    reasoningTrace.push(
+                        `value_sample_word_match:${key}=${bestMatch.rawValue}`
+                    );
+                }
             }
-        }
-    });
+        );
+    }
 
     const dedup = new Map<string, ScopeBoundFilter>();
     for (const item of boundFilters) {
@@ -442,9 +595,17 @@ export function extractGeoQueryScope(input: {
             dedup.set(mapKey, item);
         }
     }
-    const finalBoundFilters = [...dedup.values()];
+    let finalBoundFilters = [...dedup.values()];
+    const beforePrune = finalBoundFilters.length;
+    finalBoundFilters = pruneSubsumedBoundFilters(finalBoundFilters, qNorm);
+    if (finalBoundFilters.length < beforePrune) {
+        reasoningTrace.push(
+            `value_sample_pruned_subsumed=${
+                beforePrune - finalBoundFilters.length
+            }`
+        );
+    }
 
-    const qTokens = tokenizeQuestion(qNorm);
     const datasetScopeMentions = (input.datasetScopeTerms || [])
         .map((term) => norm(term))
         .filter(

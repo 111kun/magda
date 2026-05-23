@@ -649,14 +649,6 @@ export function sanitizeGeoSql(
         );
     }
 
-    if (!/\blimit\s+\d+\b/i.test(output) && !isScalarAggregateSelect(output)) {
-        const trimmed = output.trim().replace(/;+\s*$/g, "");
-        output = `${trimmed}\nLIMIT 100`;
-        fixes.push(
-            "Added LIMIT 100 safety guard to avoid large unbounded result sets."
-        );
-    }
-
     return { query: output, fixes };
 }
 

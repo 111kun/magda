@@ -42,6 +42,11 @@ import {
     parseLlmUsageFromSystemLogs
 } from "helpers/geoSqlEvalMetrics";
 import { generateBaselineDirectSql } from "helpers/geoSqlBaselineDirect";
+import {
+    formatEvalCaseTimeoutLabel,
+    resolveEvalCaseTimeoutMs,
+    withEvalCaseTimeout
+} from "helpers/geoSqlEvalCaseTimeout";
 import { buildGeoFileDescriptionsAndIntro } from "./tools/queryGeoDataset/description";
 import { isGeoSpatialDistribution } from "./tools/queryGeoDataset/distribution";
 import {
@@ -534,10 +539,17 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                 );
             }
 
+            const caseTimeoutMs = resolveEvalCaseTimeoutMs(llmProvider);
             snapLog(
                 evalPipeline === "baseline_direct"
                     ? "Phase 2/3: per-case baseline (profile + question → LLM SQL → execute)"
                     : "Phase 2/3: per-case stream (spatial_sql → plan → execute → capture final SQL)",
+                "info"
+            );
+            snapLog(
+                `Per-case timeout: ${formatEvalCaseTimeoutLabel(
+                    caseTimeoutMs
+                )} (LLM phase; then skip to next case)`,
                 "info"
             );
 
@@ -615,49 +627,82 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                         continue;
                     }
 
-                    let collected: {
-                        runLogs: string[];
-                        streamError?: string;
-                    };
-                    let sqlFirst: string | undefined;
-                    let sqlFinal: string | undefined;
-                    let sanitizerFixes: string[] | undefined;
-                    let caseLlmUsage: ReturnType<typeof parseLlmUsageFromSystemLogs>;
+                    const llmPhase = await withEvalCaseTimeout(
+                        c.id,
+                        caseTimeoutMs,
+                        async () => {
+                            let collected: {
+                                runLogs: string[];
+                                streamError?: string;
+                            };
+                            let sqlFirst: string | undefined;
+                            let sqlFinal: string | undefined;
+                            let sanitizerFixes: string[] | undefined;
+                            let caseLlmUsage: ReturnType<typeof parseLlmUsageFromSystemLogs>;
 
-                    if (evalPipeline === "baseline_direct") {
-                        if (!baselinePrepared || !baselineEngine) {
-                            throw new Error("Baseline context not prepared.");
-                        }
-                        const baseline = await generateBaselineDirectSql(
-                            baselineEngine,
-                            {
-                                question: c.question,
-                                metadataBrief: baselinePrepared.metadataBrief,
-                                fileDescItems: baselinePrepared.fileDescItems
+                            if (evalPipeline === "baseline_direct") {
+                                if (!baselinePrepared || !baselineEngine) {
+                                    throw new Error(
+                                        "Baseline context not prepared."
+                                    );
+                                }
+                                const baseline = await generateBaselineDirectSql(
+                                    baselineEngine,
+                                    {
+                                        question: c.question,
+                                        metadataBrief:
+                                            baselinePrepared.metadataBrief,
+                                        fileDescItems:
+                                            baselinePrepared.fileDescItems
+                                    }
+                                );
+                                collected = { runLogs: baseline.systemLogs };
+                                caseLlmUsage =
+                                    baseline.llm_usage ||
+                                    parseLlmUsageFromSystemLogs(
+                                        baseline.systemLogs
+                                    );
+                                sqlFinal = baseline.sql?.trim();
+                                sqlFirst = sqlFinal;
+                                if (baseline.rejectReason && !sqlFinal) {
+                                    collected.streamError =
+                                        baseline.rejectReason;
+                                }
+                            } else {
+                                const caseStream = await agent.stream(
+                                    c.question,
+                                    {
+                                        geoEvalCaptureExecutedSql: true
+                                    }
+                                );
+                                collected = await collectStream(caseStream);
+                                caseLlmUsage = parseLlmUsageFromSystemLogs(
+                                    collected.runLogs
+                                );
+                                const input = agent.lastEvalChainInput;
+                                sqlFirst = input?.evalCapturedExecutedSqlFirst?.trim();
+                                sqlFinal = input?.evalCapturedExecutedSql?.trim();
+                                sanitizerFixes =
+                                    input?.evalCapturedSanitizerFixes;
                             }
-                        );
-                        collected = { runLogs: baseline.systemLogs };
-                        caseLlmUsage =
-                            baseline.llm_usage ||
-                            parseLlmUsageFromSystemLogs(baseline.systemLogs);
-                        sqlFinal = baseline.sql?.trim();
-                        sqlFirst = sqlFinal;
-                        if (baseline.rejectReason && !sqlFinal) {
-                            collected.streamError = baseline.rejectReason;
+
+                            return {
+                                collected,
+                                sqlFirst,
+                                sqlFinal,
+                                sanitizerFixes,
+                                caseLlmUsage
+                            };
                         }
-                    } else {
-                        const caseStream = await agent.stream(c.question, {
-                            geoEvalCaptureExecutedSql: true
-                        });
-                        collected = await collectStream(caseStream);
-                        caseLlmUsage = parseLlmUsageFromSystemLogs(
-                            collected.runLogs
-                        );
-                        const input = agent.lastEvalChainInput;
-                        sqlFirst = input?.evalCapturedExecutedSqlFirst?.trim();
-                        sqlFinal = input?.evalCapturedExecutedSql?.trim();
-                        sanitizerFixes = input?.evalCapturedSanitizerFixes;
-                    }
+                    );
+
+                    const {
+                        collected,
+                        sqlFirst,
+                        sqlFinal,
+                        sanitizerFixes,
+                        caseLlmUsage
+                    } = llmPhase;
 
                     const caseFinishedAt = new Date().toISOString();
                     const caseWallMs = performance.now() - caseT0;
@@ -802,11 +847,17 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                     );
                 } catch (caseErr) {
                     const caseWallMs = performance.now() - caseT0;
+                    const errText = String(caseErr);
+                    const timedOut = errText.includes("timed out");
                     snapLog(
-                        `  ✗ Case error: ${caseErr} · ${formatDurationMs(
-                            caseWallMs
-                        )}`,
-                        "error"
+                        timedOut
+                            ? `  ✗ Case timeout — ${errText} · ${formatDurationMs(
+                                  caseWallMs
+                              )}`
+                            : `  ✗ Case error: ${errText} · ${formatDurationMs(
+                                  caseWallMs
+                              )}`,
+                        timedOut ? "warn" : "error"
                     );
                     caseRows.push({
                         case_id: c.id,
@@ -947,7 +998,7 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                 "info"
             );
             const progressTag = llmProvider === "openai" ? "OpenAI" : "WebLLM";
-            const agent = AgentChain.createForEval(
+            const agent = await AgentChain.createForEval(
                 appName || "Magda",
                 fakeLocation,
                 history,

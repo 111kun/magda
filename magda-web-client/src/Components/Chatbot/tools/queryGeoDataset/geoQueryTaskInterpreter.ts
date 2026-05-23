@@ -2,12 +2,16 @@ import type { MagdaChatEngine } from "../../magdaLlmEngine";
 import { webLlmChatCompletion, webLlmResetChat } from "../../webLlmSerial";
 import {
     inferDistinctCountKey,
+    inferGeomMeasurementOperation,
     inferGroupByKeysFromQuestionEnhanced,
     inferPropertyAggregateOperation,
     questionImpliesDistinctCardinality,
+    questionImpliesGeomMeasurementAggregate,
+    questionImpliesGeomPredicateCount,
     questionImpliesGroupedBreakdown,
     questionImpliesPropertyAttributeAggregate,
-    questionImpliesRowListing
+    questionImpliesRowListing,
+    questionImpliesTopologicalSpatial
 } from "./geoQueryQuestionPatterns";
 import type { GeoQueryScope } from "./scopeExtractor";
 
@@ -54,6 +58,7 @@ export type SpatialConstraintSummary = {
         | "NEAREST_K"
         | "TOPOLOGY"
         | "MEASURE"
+        | "GEOM_PREDICATE"
         | "VIEWPORT";
     operator_family_hint?: string;
     parameters?: Record<string, number | string>;
@@ -152,13 +157,32 @@ function resolveTargetPattern(
         return "LIST_ROWS";
     }
     if (
+        groupByKeys.length > 0 &&
+        (scope.intentType === "aggregate" ||
+            questionImpliesGroupedBreakdown(question))
+    ) {
+        return "AGGREGATE_GROUP_BY";
+    }
+    if (
+        questionImpliesGeomMeasurementAggregate(question) &&
+        groupByKeys.length === 0
+    ) {
+        return "MEASUREMENT";
+    }
+    if (
         questionImpliesPropertyAttributeAggregate(question) &&
         groupByKeys.length === 0
     ) {
-        return "FILTER_COUNT";
+        return "MEASUREMENT";
     }
 
     const si = scope.spatialIntent;
+    if (si.type === "geom_predicate") {
+        return scope.intentType === "count" ||
+            /(how many|number of|count of)/i.test(question)
+            ? "FILTER_COUNT"
+            : "SPATIAL_FILTER";
+    }
     if (si.type === "measurement") {
         return "MEASUREMENT";
     }
@@ -245,11 +269,78 @@ function buildSpatialSummary(scope: GeoQueryScope): SpatialConstraintSummary {
             needs_external_geocode: false
         };
     }
+    if (si.type === "geom_predicate") {
+        return {
+            mode: "GEOM_PREDICATE",
+            operator_family_hint:
+                (si.operatorFamily || []).join(" | ") ||
+                "ST_IsValid | ST_Length | ST_Perimeter | ST_Area",
+            needs_external_geocode: false
+        };
+    }
     return {
         mode: "NONE",
         needs_external_geocode: !!scope.needsExternalReference,
         external_place: scope.externalPlace
     };
+}
+
+/** Plan spatial follows task pattern; attribute GROUP BY must not inherit false topology from scope. */
+function buildSpatialSummaryForPlan(
+    scope: GeoQueryScope,
+    pattern: ExecutionTargetPattern,
+    question: string
+): SpatialConstraintSummary {
+    const spatial = buildSpatialSummary(scope);
+    if (
+        pattern === "AGGREGATE_GROUP_BY" &&
+        spatial.mode === "TOPOLOGY" &&
+        !questionImpliesTopologicalSpatial(question)
+    ) {
+        return {
+            mode: "NONE",
+            needs_external_geocode: !!scope.needsExternalReference,
+            external_place: scope.externalPlace
+        };
+    }
+    if (pattern === "MEASUREMENT") {
+        return {
+            mode: "MEASURE",
+            operator_family_hint:
+                (scope.spatialIntent.operatorFamily || []).join(" | ") ||
+                "ST_Area | ST_Length | ST_Perimeter",
+            needs_external_geocode: false
+        };
+    }
+    if (
+        pattern === "FILTER_COUNT" &&
+        (spatial.mode === "MEASURE" || spatial.mode === "GEOM_PREDICATE") &&
+        !questionImpliesGeomPredicateCount(question)
+    ) {
+        return {
+            mode: "NONE",
+            needs_external_geocode: !!scope.needsExternalReference,
+            external_place: scope.externalPlace
+        };
+    }
+    if (
+        (pattern === "AGGREGATE_GROUP_BY" || pattern === "LIST_ROWS") &&
+        spatial.mode === "GEOM_PREDICATE"
+    ) {
+        return {
+            mode: "NONE",
+            needs_external_geocode: !!scope.needsExternalReference,
+            external_place: scope.externalPlace
+        };
+    }
+    if (
+        pattern === "FILTER_COUNT" &&
+        spatial.mode === "GEOM_PREDICATE" &&
+        questionImpliesGeomPredicateCount(question)
+    ) {
+        return spatial;
+    }
+    return spatial;
 }
 
 function buildBindings(
@@ -370,14 +461,36 @@ function buildOperations(
         ];
     }
     if (pattern === "MEASUREMENT") {
-        const op =
-            question && /(perimeter|周长)/i.test(question)
-                ? "ST_Perimeter|ST_Length|ST_Area"
-                : "ST_Area|ST_Length|ST_Perimeter";
+        const geomOp = question
+            ? inferGeomMeasurementOperation(question)
+            : null;
+        if (geomOp) {
+            return [
+                {
+                    label: "geom_metric",
+                    operator: geomOp.operator,
+                    alias: geomOp.alias
+                }
+            ];
+        }
+        const propAgg =
+            question && propertyKeys?.length
+                ? inferPropertyAggregateOperation(question, propertyKeys)
+                : null;
+        if (propAgg) {
+            const access = sqlAccessForPropertyKey(propAgg.key);
+            return [
+                {
+                    label: "property_aggregate",
+                    operator: `${propAgg.fn}(${access})`,
+                    alias: `${propAgg.fn.toLowerCase()}_${propAgg.key}`
+                }
+            ];
+        }
         return [
             {
                 label: "geom_metric",
-                operator: op,
+                operator: "ST_Area(geom::geography)",
                 alias: "measure_value"
             }
         ];
@@ -470,7 +583,145 @@ function buildDraftSqlSketch(
     if (pattern === "LIST_ROWS") {
         return `SELECT id, properties->>'…', ST_AsText(geom) AS geom_wkt FROM features WHERE ${whereClause} LIMIT …`;
     }
+    if (pattern === "MEASUREMENT" && operations[0]) {
+        return `SELECT ${operations[0].operator} AS ${operations[0].alias} FROM features WHERE ${whereClause}`;
+    }
     return `-- Planner: expand using ONLY properties JSONB keys from schema; table = features`;
+}
+
+function escapeSqlLiteral(value: string): string {
+    return String(value ?? "").replace(/'/g, "''");
+}
+
+function buildWhereClauseFromBindings(
+    bindings: SchemaColumnBinding[],
+    extra?: string[]
+): string {
+    const parts = bindings
+        .filter((b) => b.role === "FILTER")
+        .map(
+            (b) =>
+                `${b.sql_access} = '${escapeSqlLiteral(
+                    b.filter_literal || ""
+                )}'`
+        );
+    if (extra?.length) {
+        parts.push(...extra);
+    }
+    return parts.length ? parts.join(" AND ") : "TRUE";
+}
+
+function buildGeomPredicateWhereExtras(question: string): string[] {
+    const q = question.toLowerCase();
+    const extras: string[] = [];
+    if (/(invalid|not valid)/i.test(q)) {
+        extras.push("NOT ST_IsValid(geom)");
+    } else if (
+        /\bvalid\b/i.test(q) &&
+        /(geometr|geom|polygon|segment)/i.test(q)
+    ) {
+        extras.push("ST_IsValid(geom)");
+    }
+    const lenMatch = q.match(
+        /(length|perimeter).{0,40}(above|>|greater than)\s*(\d+(?:\.\d+)?)\s*(m|metres?|meters?)?/
+    );
+    if (lenMatch?.[3]) {
+        const fn = /perimeter/i.test(lenMatch[1])
+            ? "ST_Perimeter(geom::geography)"
+            : "ST_Length(geom::geography)";
+        extras.push(`${fn} > ${lenMatch[3]}`);
+    }
+    const areaMatch = q.match(
+        /(larger than|greater than)\s*(\d[\d,]*)\s*(square metres?|square meters?)?/
+    );
+    if (areaMatch?.[2]) {
+        const n = areaMatch[2].replace(/,/g, "");
+        extras.push(`ST_Area(geom::geography) > ${n}`);
+    }
+    if (
+        /(smaller than|below).{0,30}(average|mean)/i.test(q) &&
+        /area/i.test(q)
+    ) {
+        extras.push(
+            "ST_Area(geom::geography) < (SELECT AVG(ST_Area(geom::geography)) FROM features)"
+        );
+    }
+    if (
+        /(shorter than|below).{0,30}(average|mean)/i.test(q) &&
+        /length/i.test(q)
+    ) {
+        extras.push(
+            "ST_Length(geom::geography) < (SELECT AVG(ST_Length(geom::geography)) FROM features)"
+        );
+    }
+    if (
+        /(above|greater than|longer than).{0,30}(average|mean)/i.test(q) &&
+        /perimeter/i.test(q)
+    ) {
+        extras.push(
+            "ST_Perimeter(geom::geography) > (SELECT AVG(ST_Perimeter(geom::geography)) FROM features)"
+        );
+    }
+    return extras;
+}
+
+/**
+ * Deterministic SQL from execution plan when Planner/contract-repair fail.
+ */
+export function buildSqlFromExecutionPlan(
+    taskSpec: GeoQueryTaskSpec,
+    question: string
+): string | null {
+    const p = taskSpec.plan;
+    const whereBase = buildWhereClauseFromBindings(p.bindings);
+    const op = p.operations[0];
+
+    if (p.target_pattern === "MEASUREMENT" && op) {
+        const extras: string[] = [];
+        if (
+            /(valid geometr|among valid|valid only)/i.test(question) &&
+            !/invalid/i.test(question)
+        ) {
+            extras.push("ST_IsValid(geom)");
+        }
+        const where =
+            extras.length > 0
+                ? whereBase === "TRUE"
+                    ? extras.join(" AND ")
+                    : `${whereBase} AND ${extras.join(" AND ")}`
+                : whereBase;
+        if (/^(SUM|AVG|MIN|MAX)\(/i.test(op.operator)) {
+            return `SELECT ${op.operator} AS ${op.alias} FROM features WHERE ${where}`;
+        }
+    }
+
+    if (p.target_pattern === "FILTER_COUNT" && op) {
+        if (/^COUNT\s*\(\s*DISTINCT/i.test(op.operator)) {
+            return `SELECT ${op.operator} AS ${op.alias} FROM features WHERE ${whereBase}`;
+        }
+        if (/^(SUM|AVG|MIN|MAX)\(/i.test(op.operator)) {
+            return `SELECT ${op.operator} AS ${op.alias} FROM features WHERE ${whereBase}`;
+        }
+        if (questionImpliesGeomPredicateCount(question)) {
+            const extras = buildGeomPredicateWhereExtras(question);
+            const where =
+                extras.length > 0
+                    ? whereBase === "TRUE"
+                        ? extras.join(" AND ")
+                        : `${whereBase} AND ${extras.join(" AND ")}`
+                    : whereBase;
+            return `SELECT COUNT(*) AS ${
+                op.alias || "total_count"
+            } FROM features WHERE ${where}`;
+        }
+        if (whereBase !== "TRUE" || op.operator === "COUNT(*)") {
+            return `SELECT COUNT(*) AS ${
+                op.alias || "total_count"
+            } FROM features WHERE ${whereBase}`;
+        }
+    }
+
+    return null;
 }
 
 function buildLogicTraceLines(
@@ -549,7 +800,7 @@ export function buildSchemaLinkedExecutionPlan(input: {
         question,
         propertyKeys
     );
-    const spatial = buildSpatialSummary(scope);
+    const spatial = buildSpatialSummaryForPlan(scope, pattern, question);
     const output_columns = buildOutputColumns(pattern, groupByKeys, operations);
     const answer_shape_guardrail = buildAnswerShapeGuardrail(
         pattern,
@@ -634,12 +885,28 @@ function mergePlanWithLlmPatch(
     scope: GeoQueryScope,
     question: string
 ): SchemaLinkedExecutionPlan {
+    const lockMeasurement =
+        base.target_pattern === "MEASUREMENT" ||
+        questionImpliesGeomMeasurementAggregate(question) ||
+        (questionImpliesPropertyAttributeAggregate(question) &&
+            !/(how many|number of|count of)/i.test(question));
+
     let pattern = base.target_pattern;
     if (
         patch.target_pattern &&
-        isExecutionTargetPattern(patch.target_pattern)
+        isExecutionTargetPattern(patch.target_pattern) &&
+        !lockMeasurement
     ) {
         pattern = patch.target_pattern;
+    }
+    if (lockMeasurement) {
+        pattern = "MEASUREMENT";
+    } else if (
+        patch.target_pattern === "FILTER_COUNT" &&
+        (base.target_pattern === "MEASUREMENT" ||
+            questionImpliesGeomMeasurementAggregate(question))
+    ) {
+        pattern = "MEASUREMENT";
     }
 
     const groupByKeys = (() => {
@@ -725,7 +992,7 @@ function mergePlanWithLlmPatch(
         answer_shape_guardrail,
         bindings,
         operations,
-        spatial: buildSpatialSummary(scope),
+        spatial: buildSpatialSummaryForPlan(scope, pattern, question),
         output_columns,
         logic_trace,
         draft_sql_sketch
@@ -981,7 +1248,9 @@ export async function resolveGeoQueryTaskSpec(input: {
             "- target_pattern MUST be one of: FILTER_COUNT | LIST_ROWS | AGGREGATE_GROUP_BY | SPATIAL_FILTER | SPATIAL_NEAREST | SPATIAL_TOPOLOGY | MEASUREMENT | MIXED | UNKNOWN",
             "- Prefer AGGREGATE_GROUP_BY when the user wants breakdown / per category / top-N / most common / 按…分组.",
             "- Do NOT set FILTER_COUNT when the user asks for grouped breakdown, row listing, or top-N by a dimension.",
-            "- FILTER_COUNT is for scalar totals only (COUNT(*), COUNT(DISTINCT key), or property SUM/AVG without GROUP BY).",
+            "- Use MEASUREMENT for scalar SUM/AVG/MIN/MAX on ST_Area/ST_Length/ST_Perimeter or shape_Area/shape_Leng properties (footprint, total length, combined area).",
+            "- NEVER change MEASUREMENT to FILTER_COUNT for area/length/perimeter questions.",
+            "- FILTER_COUNT is for scalar totals only (COUNT(*), COUNT(DISTINCT key)).",
             "",
             "## Output JSON shape",
             '{"target_pattern":"<enum>","group_by_keys":["<key>", "..."],"logic_trace":"<one sentence>","extra_bindings":[{"physical_key":"<key>","role":"GROUP_BY"|"FILTER"|"SELECT","logical_term":"<optional>"}]}'

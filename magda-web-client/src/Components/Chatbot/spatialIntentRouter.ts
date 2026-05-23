@@ -566,7 +566,37 @@ function hasAnalysisIntent(question: string): boolean {
             text
         ) ||
         /\b(shape_[a-z0-9_]+|st_[a-z0-9_]+)\b/i.test(text) ||
-        /\b(longer than|shorter than|square meters?|typed as)\b/.test(text)
+        /\b(longer than|shorter than|square meters?|square metres?|typed as)\b/.test(
+            text
+        ) ||
+        /\b(largest|smallest|shortest|longest|typical|median|footprint)\b/.test(
+            text
+        )
+    );
+}
+
+/** Scalar geometry/property metrics (eval MEASUREMENT tags) — must not fall through to default_agent. */
+function hasMetricMeasurementQueryIntent(question: string): boolean {
+    const text = (question || "").toLowerCase().trim();
+    if (!text) {
+        return false;
+    }
+    return (
+        /\bwhat is the\b[\s\S]{0,100}\b(largest|smallest|shortest|longest|typical|median|average|combined|total|maximum|minimum)\b/i.test(
+            text
+        ) ||
+        /\b(among valid|valid geometries only|invalid geometries?)\b/.test(
+            text
+        ) ||
+        /\b(in square metres?|in metres?|perimeter of any|segment length|polygon size)\b/.test(
+            text
+        ) ||
+        /\b(shortest|longest|largest|smallest|typical)\s+(segment|polygon|perimeter|area|length)\b/.test(
+            text
+        ) ||
+        /\b(total|combined|average|typical)\s+(area|length|perimeter|footprint|size)\b/.test(
+            text
+        )
     );
 }
 
@@ -577,13 +607,14 @@ function hasStrongDataQueryIntent(question: string): boolean {
     }
     return (
         hasAnalysisIntent(text) ||
+        hasMetricMeasurementQueryIntent(text) ||
         /(显示|展示|列出|查|查询|筛选|过滤|统计|多少|哪些|有哪些|给我|看一下|导出|下载|明细|记录|行)/.test(
             text
         ) ||
         /\b(show|list|find|get|fetch|retrieve|return|display|rows?|records?|which|what are|how many|number of|total number|count of|count\b)\b/.test(
             text
         ) ||
-        /\b(which|what)\b[\s\S]{0,80}\b(most|least|more|fewer|highest|lowest|maximum|minimum|average|total|geodesic)\b/i.test(
+        /\b(which|what)\b[\s\S]{0,80}\b(most|least|more|fewer|highest|lowest|largest|smallest|shortest|longest|maximum|minimum|average|total|typical|geodesic)\b/i.test(
             text
         ) ||
         /\b(top\s*\d+|bottom\s*\d+|breakdown|grouped?\s+by|loaded in|passes?)\b/i.test(

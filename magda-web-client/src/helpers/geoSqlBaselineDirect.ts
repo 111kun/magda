@@ -2,8 +2,12 @@
  * Baseline eval: dataset profile + question → single LLM call → SQL (no AgentChain / task-spec).
  */
 import type { MagdaChatEngine } from "Components/Chatbot/magdaLlmEngine";
-import { webLlmChatCompletion } from "Components/Chatbot/webLlmSerial";
+import {
+    webLlmChatCompletion,
+    webLlmResetChat
+} from "Components/Chatbot/webLlmSerial";
 import type { EvalLlmUsageBreakdown } from "./geoSqlEvalMetrics";
+import { EVAL_CASE_TIMEOUT_MS_WEBLLM } from "./geoSqlEvalCaseTimeout";
 
 export type BaselineDirectSqlResult = {
     sql?: string;
@@ -107,13 +111,30 @@ export async function generateBaselineDirectSql(
     );
 
     let reply: Awaited<ReturnType<typeof webLlmChatCompletion>> | null = null;
+    const llmTimeoutMs = EVAL_CASE_TIMEOUT_MS_WEBLLM;
     try {
-        reply = await webLlmChatCompletion(engine, {
-            messages: [
-                { role: "system", content: system },
-                { role: "user", content: user }
-            ]
-        });
+        await webLlmResetChat(engine);
+        reply = await Promise.race([
+            webLlmChatCompletion(engine, {
+                messages: [
+                    { role: "system", content: system },
+                    { role: "user", content: user }
+                ]
+            }),
+            new Promise<never>((_, reject) =>
+                setTimeout(
+                    () =>
+                        reject(
+                            new Error(
+                                `Baseline direct LLM timed out after ${
+                                    llmTimeoutMs / 1000
+                                }s.`
+                            )
+                        ),
+                    llmTimeoutMs
+                )
+            )
+        ]);
     } catch (e) {
         push(`Baseline direct LLM call failed: ${String(e)}`);
         return { rejectReason: String(e), systemLogs };

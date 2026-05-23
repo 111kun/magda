@@ -25,6 +25,29 @@ export async function webLlmResetChat(engine: MagdaChatEngine): Promise<void> {
     });
 }
 
+/** Unload extension engine so a new ChatWebLLM can be created in the same tab. */
+export async function webLlmUnloadEngine(
+    engine: MagdaChatEngine
+): Promise<void> {
+    await enqueue(async () => {
+        try {
+            await engine.resetChat();
+        } catch {
+            /* ignore */
+        }
+        const unloadable = engine as MagdaChatEngine & {
+            unload?: () => Promise<void>;
+        };
+        if (typeof unloadable.unload === "function") {
+            try {
+                await unloadable.unload();
+            } catch {
+                /* ignore */
+            }
+        }
+    });
+}
+
 export async function webLlmChatCompletion(
     engine: MagdaChatEngine,
     request: Omit<ChatCompletionRequest, "stream">
