@@ -776,17 +776,55 @@ export async function planGeoSqlQuery(
         );
     }
 
-    if (shouldUseDeterministicRenderer(taskSpec, this.question)) {
-        const ast = astFromTaskSpec(
-            taskSpec,
-            this.question,
-            plannerPropertyKeys
+    const skipDeterministicRenderer = !!(this as ChainInput & {
+        __geoEvalDisableDeterministicRenderer?: boolean;
+    }).__geoEvalDisableDeterministicRenderer;
+    if (skipDeterministicRenderer) {
+        pushGeoRunLog(
+            this,
+            "Eval mode: deterministic SQL renderer disabled; using Planner LLM for every case."
         );
-        const deterministicSql = ast ? renderSqlFromAst(ast) : null;
-        if (deterministicSql) {
+    }
+
+    if (!skipDeterministicRenderer) {
+        if (shouldUseDeterministicRenderer(taskSpec, this.question)) {
+            const ast = astFromTaskSpec(
+                taskSpec,
+                this.question,
+                plannerPropertyKeys
+            );
+            const deterministicSql = ast ? renderSqlFromAst(ast) : null;
+            if (deterministicSql) {
+                pushGeoRunLog(
+                    this,
+                    `Deterministic SQL renderer (${taskSpec.plan.target_pattern}): skipping Planner LLM.`
+                );
+                (this as ChainInput & {
+                    __geoDeterministicSql?: boolean;
+                }).__geoDeterministicSql = true;
+                const distIdx = dists[0]?.idx ?? 0;
+                return {
+                    type: "query",
+                    distributionIndex: distIdx,
+                    sqlQuery: deterministicSql,
+                    context: planContext
+                };
+            }
             pushGeoRunLog(
                 this,
-                `Deterministic SQL renderer (${taskSpec.plan.target_pattern}): skipping Planner LLM.`
+                `Deterministic renderer skipped for ${taskSpec.plan.target_pattern} (AST/SQL not built).`
+            );
+        }
+
+        const spatialSql = tryRenderSpatialSql(
+            this.question,
+            taskSpec,
+            plannerPropertyKeys
+        );
+        if (spatialSql) {
+            pushGeoRunLog(
+                this,
+                `Spatial deterministic SQL renderer: skipping Planner LLM.`
             );
             (this as ChainInput & {
                 __geoDeterministicSql?: boolean;
@@ -795,36 +833,10 @@ export async function planGeoSqlQuery(
             return {
                 type: "query",
                 distributionIndex: distIdx,
-                sqlQuery: deterministicSql,
+                sqlQuery: spatialSql,
                 context: planContext
             };
         }
-        pushGeoRunLog(
-            this,
-            `Deterministic renderer skipped for ${taskSpec.plan.target_pattern} (AST/SQL not built).`
-        );
-    }
-
-    const spatialSql = tryRenderSpatialSql(
-        this.question,
-        taskSpec,
-        plannerPropertyKeys
-    );
-    if (spatialSql) {
-        pushGeoRunLog(
-            this,
-            `Spatial deterministic SQL renderer: skipping Planner LLM.`
-        );
-        (this as ChainInput & {
-            __geoDeterministicSql?: boolean;
-        }).__geoDeterministicSql = true;
-        const distIdx = dists[0]?.idx ?? 0;
-        return {
-            type: "query",
-            distributionIndex: distIdx,
-            sqlQuery: spatialSql,
-            context: planContext
-        };
     }
 
     const executionPlanJson = formatTaskSpecExecutionPlanForPlanner(taskSpec);

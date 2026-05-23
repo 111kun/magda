@@ -103,6 +103,8 @@ export interface ChainInput {
     spatialCoverage?: SpatialCoverageHint;
     /** GeoSQL eval harness: queryGeoDataset fills executed SQL after a successful run. */
     geoEvalCaptureExecutedSql?: boolean;
+    /** Eval: skip deterministic/spatial SQL renderers; every case uses Planner LLM. */
+    geoEvalDisableDeterministicRenderer?: boolean;
     /** When true, createChain only runs profile enrichment and skips LLM routing/tools. */
     warmupOnly?: boolean;
     evalCapturedExecutedSqlFirst?: string;

@@ -78,13 +78,17 @@ const LS_OPENAI_MODEL = "magdaGeoSqlEvalOpenAiModel";
 const LS_EVAL_PIPELINE = "magdaGeoSqlEvalPipeline";
 
 export type EvalLlmProvider = "webllm" | "openai";
-export type EvalPipelineMode = "agent" | "baseline_direct";
+export type EvalPipelineMode =
+    | "agent"
+    | "agent_full_planner"
+    | "baseline_direct";
 
 function loadEvalPipeline(): EvalPipelineMode {
     try {
-        return localStorage.getItem(LS_EVAL_PIPELINE) === "baseline_direct"
-            ? "baseline_direct"
-            : "agent";
+        const v = localStorage.getItem(LS_EVAL_PIPELINE);
+        if (v === "baseline_direct") return "baseline_direct";
+        if (v === "agent_full_planner") return "agent_full_planner";
+        return "agent";
     } catch {
         return "agent";
     }
@@ -672,7 +676,10 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                                 const caseStream = await agent.stream(
                                     c.question,
                                     {
-                                        geoEvalCaptureExecutedSql: true
+                                        geoEvalCaptureExecutedSql: true,
+                                        geoEvalDisableDeterministicRenderer:
+                                            evalPipeline ===
+                                            "agent_full_planner"
                                     }
                                 );
                                 collected = await collectStream(caseStream);
@@ -1117,7 +1124,9 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                 const pipelineLabel =
                     evalPipeline === "baseline_direct"
                         ? "baseline direct (profile + question → SQL)"
-                        : "production AgentChain";
+                        : evalPipeline === "agent_full_planner"
+                        ? "AgentChain planner-only (no deterministic SQL)"
+                        : "AgentChain deterministic (production default)";
                 appendLog(
                     resumeCp
                         ? `=== Resuming eval (${mode}) run ${runId} — ${pipelineLabel} ===`
@@ -1471,14 +1480,20 @@ const GeoSqlEvalRunnerInner: React.FC<{ appName: string }> = ({ appName }) => {
                             name="evalPipeline"
                             value={evalPipeline}
                             onChange={(v) => {
-                                setEvalPipeline(v as EvalPipelineMode);
+                                const mode = v as EvalPipelineMode;
+                                setEvalPipeline(mode);
+                                localStorage.setItem(LS_EVAL_PIPELINE, mode);
                                 agentRef.current = null;
                             }}
                             disabled={running}
                         >
                             <Radio value="agent">
-                                Full pipeline — AgentChain, task-spec, spatial
-                                contracts
+                                Agent — deterministic (task-spec + AST SQL
+                                renderer)
+                            </Radio>
+                            <Radio value="agent_full_planner">
+                                Agent — planner only (task-spec, every case uses
+                                Planner LLM)
                             </Radio>
                             <Radio value="baseline_direct">
                                 Baseline direct — dataset profile + question →

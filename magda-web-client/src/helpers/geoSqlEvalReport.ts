@@ -88,8 +88,8 @@ export type GeoSqlEvalReport = {
         app_name?: string;
         llm_provider?: "webllm" | "openai";
         openai_model?: string;
-        /** agent = full AgentChain; baseline_direct = profile + question → one LLM SQL */
-        eval_pipeline?: "agent" | "baseline_direct";
+        /** agent = deterministic renderer; agent_full_planner = slim planner every case; baseline_direct = no AgentChain */
+        eval_pipeline?: "agent" | "agent_full_planner" | "baseline_direct";
         run_timing?: EvalRunTiming;
         llm_usage_total?: EvalLlmUsageBreakdown;
     };
@@ -209,7 +209,7 @@ export function buildReport(params: {
     llmProvider?: "webllm" | "openai";
     openAiModel?: string;
     runTiming?: EvalRunTiming;
-    evalPipeline?: "agent" | "baseline_direct";
+    evalPipeline?: "agent" | "agent_full_planner" | "baseline_direct";
 }): GeoSqlEvalReport {
     const summary = buildSummary(params.cases);
     return {
@@ -217,6 +217,8 @@ export function buildReport(params: {
             framework:
                 params.evalPipeline === "baseline_direct"
                     ? "GeoSQL-Eval baseline direct (profile + question → LLM SQL; Layer A/B same harness)"
+                    : params.evalPipeline === "agent_full_planner"
+                    ? "GeoSQL-Eval agent planner-only (AgentChain + task-spec; no deterministic SQL renderer)"
                     : "GeoSQL-Eval two-layer (Layer A: SA/EPR; Layer B: scalar numeric or row-set semantic match) — Final Report §4.3",
             generated_at: new Date().toISOString(),
             dataset_slug: params.slug,

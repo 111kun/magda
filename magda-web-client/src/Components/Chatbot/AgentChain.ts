@@ -305,6 +305,7 @@ class AgentChain {
         question: string,
         streamOpts?: {
             geoEvalCaptureExecutedSql?: boolean;
+            geoEvalDisableDeterministicRenderer?: boolean;
             warmupOnly?: boolean;
         }
     ): Promise<AsyncIterable<ChatEventMessage>> {
@@ -320,10 +321,15 @@ class AgentChain {
             distribution: this.distribution,
             keyContextData: this.keyContextData,
             geoEvalCaptureExecutedSql: streamOpts?.geoEvalCaptureExecutedSql,
+            geoEvalDisableDeterministicRenderer:
+                streamOpts?.geoEvalDisableDeterministicRenderer,
             warmupOnly: streamOpts?.warmupOnly
         };
         if (streamOpts?.geoEvalCaptureExecutedSql) {
             (input as any).__geoEvalSkipImport = true;
+        }
+        if (streamOpts?.geoEvalDisableDeterministicRenderer) {
+            (input as any).__geoEvalDisableDeterministicRenderer = true;
         }
         this.lastEvalChainInput = input;
 
