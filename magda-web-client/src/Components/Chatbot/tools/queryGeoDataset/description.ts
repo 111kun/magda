@@ -5,7 +5,8 @@
  */
 import { ParsedDataset, ParsedDistribution } from "helpers/record";
 import toYaml from "libs/toYaml";
-import { SpatialProfileItem } from "../../commons";
+import { ChainInput, SpatialProfileItem } from "../../commons";
+import { webLlmChatCompletion, webLlmResetChat } from "../../webLlmSerial";
 import {
     importSpatialFromDistribution,
     runPostgisQuery
@@ -275,6 +276,41 @@ export async function buildGeoDatasetIntroContext(
 ): Promise<string | null> {
     const profiles = await buildGeoFileProfiles(distItems);
     return buildGeoDatasetIntroContextFromProfiles(profiles);
+}
+
+/** LLM dataset blurb for chat welcome (not tied to a user question). */
+export async function generateGeoDatasetIntro(
+    input: ChainInput,
+    introContext: string | null
+): Promise<string | null> {
+    if (!introContext) {
+        return null;
+    }
+    try {
+        const engine = await input.model.getEngine();
+        await webLlmResetChat(engine);
+        const reply = await webLlmChatCompletion(engine, {
+            messages: [
+                {
+                    role: "system",
+                    content:
+                        "You are Magda, a helpful data assistant. Write a short, natural introduction for the current spatial dataset. " +
+                        "Use plain prose (no YAML labels, no markdown fences, no mention of internal schema binding). " +
+                        "Summarise what the dataset appears to contain and suggest the kinds of geo questions the user can ask."
+                },
+                {
+                    role: "user",
+                    content:
+                        "The user just opened the dataset chat panel and has not asked a question yet.\n\n" +
+                        `Spatial dataset context:\n${introContext}`
+                }
+            ]
+        });
+        const text = reply?.choices?.[0]?.message?.content?.trim();
+        return text || null;
+    } catch {
+        return null;
+    }
 }
 
 export function buildGeoSqlToolDescription(

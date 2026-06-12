@@ -71,6 +71,9 @@ import {
 } from "./queryGeoDataset/geoQueryQuestionPatterns";
 import type { GeoReference, SpatialIntentResult } from "../chatRouteRouter";
 
+/** TEMP: screenshot / repair demo — revert to `false` before merge or release. */
+const TEMP_FORCE_FULL_PLANNER = true;
+
 type GeoSqlPlanContext = {
     scope: GeoQueryScope;
     reference: GeoReference;
@@ -776,13 +779,17 @@ export async function planGeoSqlQuery(
         );
     }
 
-    const skipDeterministicRenderer = !!(this as ChainInput & {
-        __geoEvalDisableDeterministicRenderer?: boolean;
-    }).__geoEvalDisableDeterministicRenderer;
+    const skipDeterministicRenderer =
+        TEMP_FORCE_FULL_PLANNER ||
+        !!(this as ChainInput & {
+            __geoEvalDisableDeterministicRenderer?: boolean;
+        }).__geoEvalDisableDeterministicRenderer;
     if (skipDeterministicRenderer) {
         pushGeoRunLog(
             this,
-            "Eval mode: deterministic SQL renderer disabled; using Planner LLM for every case."
+            TEMP_FORCE_FULL_PLANNER
+                ? "TEMP: full-planner mode (deterministic SQL renderer disabled); using Planner LLM for every case."
+                : "Eval mode: deterministic SQL renderer disabled; using Planner LLM for every case."
         );
     }
 
@@ -1462,6 +1469,11 @@ function isLikelyHexWkbText(value: string): boolean {
     );
 }
 
+/** Map-only geometry columns: kept in queryResult, omitted from chat markdown table. */
+function isChatTableHiddenColumn(key: string): boolean {
+    return /^(geom_wkt|geom_geojson)$/i.test(key.trim());
+}
+
 function formatRecordValueForDisplay(key: string, value: unknown): string {
     if (value === null || typeof value === "undefined") {
         return "";
@@ -2117,7 +2129,9 @@ export async function queryGeoSpatialWithSQLQuery(
 
     pushGeoUserMessage(this, formatFinalGeoSqlMessage(sqlToRun));
     this.keyContextData.queryResult = records;
-    const tableHeaders = Object.keys(records[0]);
+    const tableHeaders = Object.keys(records[0]).filter(
+        (key) => !isChatTableHiddenColumn(key)
+    );
     const table = markdownTable([
         tableHeaders,
         ...records.map((item) =>

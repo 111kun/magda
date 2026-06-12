@@ -87,10 +87,10 @@ function loadEvalPipeline(): EvalPipelineMode {
     try {
         const v = localStorage.getItem(LS_EVAL_PIPELINE);
         if (v === "baseline_direct") return "baseline_direct";
-        if (v === "agent_full_planner") return "agent_full_planner";
-        return "agent";
+        if (v === "agent") return "agent";
+        return "agent_full_planner";
     } catch {
-        return "agent";
+        return "agent_full_planner";
     }
 }
 
